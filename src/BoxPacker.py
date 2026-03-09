@@ -81,6 +81,7 @@ class BoxPacker:
         center = self.edge_length / 2
 
         with open(f"{self.project_dir}/{self.filename}.inp", "w") as f:
+            f.write(f"pbc 0. 0. 0. {self.edge_length} {self.edge_length} {self.edge_length}\n")
             if self.mixture_type == 0:
                 f.write(f"tolerance {self.tolerance}\n")
                 f.write(f"filetype pdb\n")

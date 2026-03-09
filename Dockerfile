@@ -7,4 +7,4 @@ RUN micromamba install -y -n base -f /tmp/environment.yml && \
 
 COPY entrypoint.sh /entrypoint.sh
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/_entrypoint.sh", "/entrypoint.sh"]
