@@ -2,18 +2,13 @@ name: base
 channels:
   - conda-forge
 dependencies:
-  - python=3.12
-  - openmm=8.4.0
-  - ambertools=23.3
-  - mdtraj
+  - openmm
   - openff-toolkit
-  - openff-forcefields
-  - rdkit
-  - jupyterlab
-  - numpy
-  - scipy
-  - pandas
-  - matplotlib
-  - nglview
-  - openmmforcefields
   - packmol
+  - rdkit
+  - ambertools
+  - pip
+  - scipy
+  - nglview
+  - mdtraj
+  - openmmforcefields
