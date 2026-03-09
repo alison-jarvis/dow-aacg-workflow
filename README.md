@@ -2,27 +2,31 @@
 
 ## Docker Usage and Setup
 
-To set up the docker environment, on the command line first run `./build.sh` (if you get a permission denied error you may need to `chmod +x ./build.sh` first). This will take a bit of time, but only needs to be run once. You should rebuild only if the docker image changes. Then run `./interactive.sh` (again you may need to `chmod +x ./interactive.sh`), which will launch you into the docker container. 
+To set up the docker environment, on the command line first run `./build.sh` (if you get a permission denied error you may need to `chmod +x ./build.sh` first). This will take a bit of time, but only needs to be run once. You should rebuild only if the docker image changes. 
 
 ## Code Usage
 
 ### Simulation
 
-To run an AAMD simulation, on the command line within the docker container run the following:
+To run an AAMD simulation, on the command line run the following:
 
-`python src/run_aamd.py <system_config_file_name> <general_config_file_name>`
+`./run_sim.sh <system_config_file_name> <general_config_file_name>`
+
+If you have GPU acceleration available to you, you can also run a simulation using nvidia. This will be much faster. To do this, instead run:
+
+`./run_sim_nvidia.sh <system_config_file_name> <general_config_file_name>`
 
 The system config file name will be used as the simulation identifier, and a trajectory file will be written out to the project folder as `system_config_file_name.dcd`. Note that you do not need to provide the extension or full path to these files, just the name. By default it will search within the expected `system_config_files` and `general_config_files` folders. If the files are not found there, it will also search in the main directory. 
 
 ### Visualizations
 
-To generate plots of the quantities openMM logs for a given project, use the command `python src/plot_aamd.py <project name>`. This will create plots of temperature, density, volume, and energies, and write them out to a plot folder within the project directory. 
+To generate plots of the quantities openMM logs for a given project, use the command `./plot_sim.sh <project name>`. This will create plots of temperature, density, volume, and energies, and write them out to a plot folder within the project directory. 
 
 To visualize the trajectory file for a given project, in a jupyter notebook cell run `from src.aamd_utils import visualize_trajectory`, and then run `view = visualize_trajectory("<project name>")`, and then `view`. This will display an interactive movie of the trajectory.  
 
 ### Example
 
-An example of running these commands for the mixed packed system, NVT simulation, and the default general config file (using openff forcefield) would be `python src/run_aamd.py mixed_nvt gen_default`. This creates a folder Project_Mixed with the trajectory dcd, topology pdb, and simulation log files. You could then plot the quantities from the log.txt file using `python src/plot_aamd.py Project_Mixed`. 
+An example of running these commands for the mixed packed system, NVT simulation, and the default general config file (using openff forcefield) would be `./run_sim.sh mixed_nvt gen_default`. This creates a folder `Project_Mixed_NVT` with the trajectory dcd, topology pdb, and simulation log files. You could then plot the quantities from the log.txt file using `./plot_sim.sh Project_Mixed_NVT`. 
 
 ## Config Files
 
