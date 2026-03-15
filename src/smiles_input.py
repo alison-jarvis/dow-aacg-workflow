@@ -17,8 +17,8 @@ def format_pdb_atom_line(line: str, resname: str, resid: int = 1, chain_id: str 
     while len(chars) < 80:
         chars.append(" ")
 
-    resname = resname[:3].upper()[:3]  # Ensure resname is 3 characters
-    resid_str = str(int(resid)).rjust(4)  # Right-justify resid to 4 characters
+    resname = resname.upper()[:3].rjust(3)  # Ensure resname is 3 characters
+    resid_str = str(int(resid)).rjust(4)  # Ensure resid is 4 characters
     chain_id = (chain_id or "A")[0]  # Use first character of chain_id or default to 'A'
 
     chars[17:20] = list(resname)  # Residue name in columns 18-20
@@ -38,7 +38,7 @@ def pdb_from_smiles(smiles : str, filepath = "./pdbs", resname: str = "MOL", res
     pdb_path = f"{filepath}/{smiles}.pdb"
     tmp_path = f"{filepath}/{smiles}_tmp.pdb"
 
-    m.to_file(f"{filepath}/{smiles}.pdb", file_format = "pdb")
+    m.to_file(tmp_path, file_format = "pdb")
 
     #label residues
     with open(tmp_path, "r") as fin, open(pdb_path, "w") as fout:
