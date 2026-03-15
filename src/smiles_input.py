@@ -5,7 +5,29 @@ from scipy.constants import Avogadro
 import os
 import math
 
-def pdb_from_smiles(smiles : str, filepath = "./pdbs") -> Molecule:
+def format_pdb_atom_line(line: str, resname: str, resid: int = 1, chain_id: str = "A") -> str:
+    """
+    Replace residue columns in PDB file with an actual label, used for grouping later
+    """
+    if not (line.startswith("ATOM") or line.startswith("HETATM")):
+        return line
+    
+    chars = list(line.rstrip("\n"))
+    # pdb lines are fixed width, so we need to make sure the line is long enough
+    while len(chars) < 80:
+        chars.append(" ")
+
+    resname = resname[:3].upper()[:3]  # Ensure resname is 3 characters
+    resid_str = str(int(resid)).rjust(4)  # Right-justify resid to 4 characters
+    chain_id = (chain_id or "A")[0]  # Use first character of chain_id or default to 'A'
+
+    chars[17:20] = list(resname)  # Residue name in columns 18-20
+    chars[21] = chain_id  # Chain ID in column 22
+    chars[22:26] = list(resid_str)  # Residue ID in columns 23-26
+
+    return "".join(chars) + "\n"
+
+def pdb_from_smiles(smiles : str, filepath = "./pdbs", resname: str = "MOL", resid: int = 1, chain_id: str = "A") -> Molecule:
     """
     Generates a pdb from a SMILES string and saves it as the SMILES.pdb
     """
@@ -13,7 +35,17 @@ def pdb_from_smiles(smiles : str, filepath = "./pdbs") -> Molecule:
     m.generate_conformers()
     os.makedirs(filepath, exist_ok = True)
 
+    pdb_path = f"{filepath}/{smiles}.pdb"
+    tmp_path = f"{filepath}/{smiles}_tmp.pdb"
+
     m.to_file(f"{filepath}/{smiles}.pdb", file_format = "pdb")
+
+    #label residues
+    with open(tmp_path, "r") as fin, open(pdb_path, "w") as fout:
+        for line in fin:
+            fout.write(format_pdb_atom_line(line, resname, resid, chain_id))
+
+    os.remove(tmp_path)
 
     return m
 
