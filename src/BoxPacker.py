@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 from openff.toolkit import Molecule, Topology
-from rdkit.Chem import MolFromSmiles, Descriptors
+from rdkit.Chem import MolFromSmiles, Descriptors, rdMolDescriptors
 from scipy.constants import Avogadro
 
 class BoxPacker:
@@ -34,7 +34,7 @@ class BoxPacker:
             path.mkdir(parents=True, exist_ok=True)
             print(f"Project directory '{path}' created")
 
-        os.makedirs(self.pdb_dir, parents=True, exist_ok=True)
+        Path(self.pdb_dir).mkdir(parents=True, exist_ok=True)
 
         self.solvents, self.cois = self.build_structure_pdbs()
         self.edge_length, self.boxes, self.coi_radius = get_boxes(self.config)
@@ -88,14 +88,19 @@ class BoxPacker:
         """
         Makes the structure pdbs from the config dicts
         """
-        try:
-            values = self.config["solvents"] + self.config["compounds of interest"]
-        except:
-            values = self.config["solvents"]
+        solvents = self.config["solvents"]
+        cois = self.config.get("compounds of interest", [])
+
+        values = solvents + cois
         molecules = []
+
         for smiles in values:
-            molecules.append(self.pdb_from_smiles(smiles))
-        return self.config["solvents"], self.config["compounds of interest"]
+            mol = MolFromSmiles(smiles)
+            formula = rdMolDescriptors.CalcMolFormula(mol)
+            resname = formula[:3].upper()
+            molecules.append(self.pdb_from_smiles(smiles, resname=resname))
+
+        return solvents, cois
     
     def write_input(self):
         """

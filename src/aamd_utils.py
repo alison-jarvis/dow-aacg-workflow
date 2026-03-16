@@ -11,7 +11,7 @@ from openff.units.openmm import from_openmm
 from openff.units import unit as off_unit
 from openmm.unit import picosecond, femtoseconds, bar
 from openmm import LangevinIntegrator
-from openmm.app import Simulation, PDBReporter, StateDataReporter
+from openmm.app import Simulation, PDBReporter, DCDReporter, StateDataReporter
 from openmm import MonteCarloBarostat
 from sys import stdout
 import pandas as pd
@@ -554,7 +554,7 @@ def run_aamd_simulation(system, topology, positions, temperature, pressure, simu
         simulation.step(equil_steps)
 
     # Add reporters for production
-    simulation.reporters.append(PDBReporter(trajectory_path, report_interval))
+    simulation.reporters.append(DCDReporter(trajectory_path, report_interval))
     simulation.reporters.append(StateDataReporter(stdout, 5000, step=True, temperature=True, density=True)) # another constant, always prints out at frequency of 5000 steps
     if save_diagnostics:
         log_path = project_name + '/' + identifier + "_log.txt"
