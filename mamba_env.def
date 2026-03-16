@@ -6,8 +6,12 @@ From: mambaorg/micromamba
     entrypoint.sh /entrypoint.sh
 
 %post
-    # Install the environment and clean up cache
-    micromamba install -y -n base -f /environment.yml
+    DETECTED_CUDA=$(nvidia-smi | grep -E -o "CUDA Version: [0-9]+\.[0-9]+" | awk '{print $3}')
+    
+    echo "Container detected CUDA: $DETECTED_CUDA"
+    export CONDA_OVERRIDE_CUDA=$DETECTED_CUDA
+    
+    micromamba create -y -f /environment.yml
     micromamba clean --all --yes
     
     # Ensure your custom entrypoint script is executable
