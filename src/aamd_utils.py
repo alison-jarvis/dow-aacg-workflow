@@ -11,7 +11,7 @@ from openff.units.openmm import from_openmm
 from openff.units import unit as off_unit
 from openmm.unit import picosecond, femtoseconds, bar
 from openmm import LangevinIntegrator
-from openmm.app import Simulation, DCDReporter, StateDataReporter
+from openmm.app import Simulation, PDBReporter, DCDReporter, StateDataReporter
 from openmm import MonteCarloBarostat
 from sys import stdout
 import pandas as pd
