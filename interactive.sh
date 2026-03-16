@@ -1,3 +1,3 @@
 #!/bin/sh
 
-apptainer run --nv smiles.sif
+sudo apptainer run --nvccli smiles.sif

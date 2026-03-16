@@ -1,29 +1,34 @@
 Bootstrap: docker
 From: mambaorg/micromamba
 
+# 1. Define the argument with a safe fallback
+%arguments
+    CUDA_VER=""
+
 %files
     environment.yml /environment.yml
     entrypoint.sh /entrypoint.sh
 
 %post
-    DETECTED_CUDA=$(nvidia-smi | grep -E -o "CUDA Version: [0-9]+\.[0-9]+" | awk '{print $3}')
+    export MAMBA_ROOT_PREFIX=/opt/conda
+
+    # 2. Inject the dynamically detected version from your host
+    export CONDA_OVERRIDE_CUDA="{{ CUDA_VER }}"
+    echo "Forcing Conda to use CUDA Version: $CONDA_OVERRIDE_CUDA"
     
-    echo "Container detected CUDA: $DETECTED_CUDA"
-    export CONDA_OVERRIDE_CUDA=$DETECTED_CUDA
-    
-    micromamba create -y -f /environment.yml
+    # 3. Install directly into the base environment
+    micromamba install -y -n base -f /environment.yml
     micromamba clean --all --yes
     
-    # Ensure your custom entrypoint script is executable
     chmod +x /entrypoint.sh
 
-%runscript
-    # Chains the micromamba activation script into your custom entrypoint
-    if [ $# -eq 0 ]; then
-        exec /usr/local/bin/_entrypoint.sh /entrypoint.sh /bin/bash
-    else
-        exec /usr/local/bin/_entrypoint.sh /entrypoint.sh "$@"
-    fi
-
 %environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
     export PATH="/opt/conda/bin:$PATH"
+
+%runscript
+    if [ $# -eq 0 ]; then
+        exec micromamba run -n base /entrypoint.sh /bin/bash
+    else
+        exec micromamba run -n base /entrypoint.sh "$@"
+    fi
