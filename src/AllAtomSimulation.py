@@ -1,5 +1,6 @@
 from aamd_utils import *
 from BoxPacker import BoxPacker
+from cg_build import build_cg_outputs
 
 class AllAtomSimulation():
 
@@ -36,9 +37,8 @@ class AllAtomSimulation():
         # Create the system from topology, molecules, and general config parameters
         self.system = create_universal_system(self.topology, self.molecules, self.general_config)
 
-    def run_simulation(self, trajectory_path=None, output_diagnostics=True):
-
-        # User information for simulation, and reminder that pressure won't be used for NVT
+    def run_simulation(self, trajectory_path=None, output_diagnostics=True, run_cg=True, cg_frame_index=0):
+        
         if self.simulation_type == "NVT":
             print(f"Running an NVT simulation for {self.project_name} at temperature {self.temperature} K. Pressure defined in the config file will not be used.")
         elif self.simulation_type == "NPT":
@@ -46,14 +46,28 @@ class AllAtomSimulation():
         else:
             raise Exception(f"Unknown simulation type {self.simulation_type}.")
         
-        # Define trajectory name corresponding to identifier, if none provided
         if trajectory_path is None:
             trajectory_path = self.project_name + '/' + self.identifier + '.dcd'
+
+        topology_path = self.project_name + '/' + self.identifier + '.pdb'
         
-        # Run the all atom simulation
-        run_aamd_simulation(self.system, self.topology, self.positions, self.temperature, self.pressure, 
-                            self.simulation_type, self.general_config, self.identifier, self.project_name, 
-                            trajectory_path, save_diagnostics=output_diagnostics)
+        run_aamd_simulation(
+            self.system,
+            self.topology,
+            self.positions,
+            self.temperature,
+            self.pressure,
+            self.simulation_type,
+            self.general_config,
+            self.identifier,
+            self.project_name,
+            trajectory_path,
+            save_diagnostics=output_diagnostics
+        )
         
         print(f"Succesful AAMD run, produced trajectory file at {trajectory_path}")
-        
+
+        if run_cg:
+            print("Running coarse-graining build...")
+            build_cg_outputs(topology_path, trajectory_path, frame_index=cg_frame_index)
+            print("CG build completed.")

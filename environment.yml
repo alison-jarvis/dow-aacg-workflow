@@ -1,4 +1,4 @@
-name: base
+name: openmm-dev
 channels:
   - conda-forge
 dependencies:
@@ -12,3 +12,5 @@ dependencies:
   - nglview
   - mdtraj
   - openmmforcefields
+  - mdanalysis
+  - matplotlib
