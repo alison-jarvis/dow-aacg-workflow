@@ -1,3 +1,6 @@
 #!/bin/sh
 
-docker run --rm -it -v $(pwd):/repo capstone/smiles python src/run_aamd.py "$@"
+# Runs your python simulation with GPU support.
+# Replace 'run_simulation.py' with your actual python script.
+# "$@" passes any CLI flags right through to python.
+apptainer run --nv smiles.sif python src/run_aamd.py "$@"

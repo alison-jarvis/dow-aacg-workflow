@@ -2,4 +2,5 @@
 
 chmod +x ./entrypoint.sh
 
-docker build -t capstone/smiles .
+# Builds the Apptainer image. (Requires sudo on most systems)
+sudo apptainer build smiles.sif mamba_env.def

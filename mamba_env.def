@@ -1,0 +1,25 @@
+Bootstrap: docker
+From: mambaorg/micromamba
+
+%files
+    environment.yml /environment.yml
+    entrypoint.sh /entrypoint.sh
+
+%post
+    # Install the environment and clean up cache
+    micromamba install -y -n base -f /environment.yml
+    micromamba clean --all --yes
+    
+    # Ensure your custom entrypoint script is executable
+    chmod +x /entrypoint.sh
+
+%runscript
+    # Chains the micromamba activation script into your custom entrypoint
+    if [ $# -eq 0 ]; then
+        exec /usr/local/bin/_entrypoint.sh /entrypoint.sh /bin/bash
+    else
+        exec /usr/local/bin/_entrypoint.sh /entrypoint.sh "$@"
+    fi
+
+%environment
+    export PATH="/opt/conda/bin:$PATH"
