@@ -1,6 +1,8 @@
 # DOW AAMD $\rightarrow$ CGMD Workflow
 
-## Docker Usage and Setup
+# THIS IS THE APPTAINER BRANCH.
+
+## APPTAINER Usage and Setup
 
 To set up the docker environment, on the command line first run `./build.sh` (if you get a permission denied error you may need to `chmod +x ./build.sh` first). This will take a bit of time, but only needs to be run once. You should rebuild only if the docker image changes. 
 
@@ -12,9 +14,7 @@ To run an AAMD simulation, on the command line run the following:
 
 `./run_sim.sh <system_config_file_name> <general_config_file_name>`
 
-If you have GPU acceleration available to you, you can also run a simulation using nvidia. This will be much faster. To do this, instead run:
-
-`./run_sim_nvidia.sh <system_config_file_name> <general_config_file_name>`
+This will detect your GPU and passthrough accordingly.
 
 The system config file name will be used as the simulation identifier, and a trajectory file will be written out to the project folder as `system_config_file_name.dcd`. Note that you do not need to provide the extension or full path to these files, just the name. By default it will search within the expected `system_config_files` and `general_config_files` folders. If the files are not found there, it will also search in the main directory. 
 
