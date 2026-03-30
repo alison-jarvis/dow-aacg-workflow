@@ -6,6 +6,8 @@ import subprocess
 from openff.toolkit import Molecule, Topology
 from rdkit.Chem import MolFromSmiles, Descriptors, rdMolDescriptors
 from scipy.constants import Avogadro
+import auto_mapper
+import MDAnalysis as mda
 
 class BoxPacker:
 
@@ -68,7 +70,7 @@ class BoxPacker:
         Generates a pdb from a SMILES string and saves it as the SMILES.pdb
         """
         m = Molecule.from_smiles(smiles)
-        m.generate_conformers()
+        m.generate_conformers(n_conformers = 1)
 
         pdb_path = f"{self.pdb_dir}/{smiles}.pdb"
         tmp_path = f"{self.pdb_dir}/{smiles}_tmp.pdb"
@@ -94,11 +96,31 @@ class BoxPacker:
         values = solvents + cois
         molecules = []
 
+        self.mapping_rules = {}
+        used_resnames = set()
+
         for smiles in values:
             mol = MolFromSmiles(smiles)
+            if mol is None:
+                raise ValueError(f"Could not parse SMILES: {smiles}")
+            
             formula = rdMolDescriptors.CalcMolFormula(mol)
-            resname = formula[:3].upper()
+
+            base_resname = formula[:3].upper().ljust(3, 'X')
+            resname = base_resname
+            counter = 1
+
+            while resname in used_resnames:
+                resname = f"{base_resname[:2]}{counter}"
+                counter += 1
+
+            used_resnames.add(resname)
+
             molecules.append(self.pdb_from_smiles(smiles, resname=resname))
+
+            mol_mapping = auto_mapper.generate_auto_mapping(smiles, cg_resname = resname)
+
+            self.mapping_rules.update(mol_mapping)
 
         return solvents, cois
     
@@ -192,4 +214,4 @@ class BoxPacker:
             print(result.stdout)
         except subprocess.CalledProcessError as e:
             print(e.stderr)
-        
+            raise e
