@@ -503,13 +503,13 @@ def run_aamd_simulation(system, topology, positions, temperature, pressure, simu
     """
 
     # Define a langevin integrator (acts as thermostat), with temperature, friction, and timestep
-    friction = general_config["friction"]
-    timestep = general_config["integration timestep"]
+    friction = general_config["aa friction"]
+    timestep = general_config["aa integration timestep"]
     integrator = LangevinIntegrator(temperature, friction/picosecond, timestep*femtoseconds)
 
     # If the system is NPT, set a barostat
     if simulation_type == "NPT":
-        barostat_frequency_steps = steps_from_ns(general_config["pressure enforcing frequency"], general_config["integration timestep"])
+        barostat_frequency_steps = steps_from_ns(general_config["aa pressure enforcing frequency"], general_config["aa integration timestep"])
         barostat = MonteCarloBarostat(pressure * bar, temperature, barostat_frequency_steps)
         system.addForce(barostat)
 
@@ -522,10 +522,10 @@ def run_aamd_simulation(system, topology, positions, temperature, pressure, simu
     simulation.minimizeEnergy()
 
     # Get necessary config params to calculate step intervals
-    timestep_fs = general_config["integration timestep"]
-    equil_time_ns = general_config["equilibration time"]
-    prod_time_ns = general_config["production time"]
-    traj_freq_ns = general_config["trajectory log frequency"]
+    timestep_fs = general_config["aa integration timestep"]
+    equil_time_ns = general_config["aa equilibration time"]
+    prod_time_ns = general_config["aa production time"]
+    traj_freq_ns = general_config["aa trajectory log frequency"]
 
     # Calculate step quantities for equilibration, production, and reporting
     equil_steps = compute_md_steps(equil_time_ns, timestep_fs)
@@ -544,7 +544,7 @@ def run_aamd_simulation(system, topology, positions, temperature, pressure, simu
         print("Short system equilibration with NVT")
         simulation.context.setVelocitiesToTemperature(temperature)
         simulation.context.setParameter(MonteCarloBarostat.Pressure(), 0 * bar) # temporarily set barostat off
-        nvt_equil_steps = steps_from_ps(100.0, general_config["integration timestep"])
+        nvt_equil_steps = steps_from_ps(100.0, general_config["aa integration timestep"])
         simulation.step(nvt_equil_steps) # total 100 ps, constant (not in config)
 
         # Set the barostat back on and perform full NPT equilibration
