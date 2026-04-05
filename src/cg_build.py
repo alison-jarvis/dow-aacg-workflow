@@ -140,17 +140,20 @@ def build_universal_bead_mapping(universe, mapping_rules):
                     f"\nFound: {found_atoms}"
                 )
             
+            unique_id = f"{cg_resname}_{bead_rule["name"]}"
+
             bead_defs.append({
                 "bead_type": bead_rule["type"],
                 "atomgroup": bead_ag,
                 "resid": mol_index,
                 "resname": cg_resname,
                 "atomname": bead_rule["name"],
+                "unique_id": unique_id,
                 "mol_index": mol_index,
             })
             
         mol_index += 1
-
+    print(bead_defs)
     return bead_defs
 
 
@@ -385,7 +388,8 @@ def build_universal_cg_outputs(topology_path, trajectory_path, mapping_rules, fr
     positions, box_lengths = compute_bead_positions(universe, bead_defs)
 
     #Group indices by bead type
-    bead_types = [b["bead_type"] for b in bead_defs]
+    bead_types = [b["unique_id"] for b in bead_defs]
+
     type_to_indices = {}
     for i, bt in enumerate(bead_types):
         type_to_indices.setdefault(bt, []).append(i)
