@@ -29,19 +29,6 @@ def build_bead_params_srel(topology, initial_gamma, initial_a):
 
     return bead_type_params
 
-# Function to get coarse grained topology object
-def generate_cg_topology(cg_trajectory_path):
-
-    # Load in starting cg pdb as a pdb object
-    pdb = PDBFile(cg_trajectory_path)
-
-    # Extract topology and positions
-    topology = pdb.topology
-    positions = pdb.positions
-
-    return topology, positions
-
-
 # Function to create coarse grained system
 def create_cg_system(topology, positions, project_name, identifier, general_config, temperature):
 
