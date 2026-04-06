@@ -180,7 +180,7 @@ def compute_bead_positions(universe, bead_defs, start=None, stop=None, step=None
     return positions, box_lengths
 
 
-def write_cg_pdb(output_path, bead_defs, positions_frame, mapping_rules=None, conect=True):
+def write_cg_pdb(output_path, bead_defs, positions_frame, box_dimensions = None, mapping_rules=None, conect=True):
     """
     Write a single-frame starting CG PDB from bead COM positions
     """
@@ -188,6 +188,11 @@ def write_cg_pdb(output_path, bead_defs, positions_frame, mapping_rules=None, co
     lines = []
     mol_serials = defaultdict(dict)
     mol_resnames = {}
+
+    if box_dimensions is not None:
+        lx, ly, lz = box_dimensions[:3]
+        cryst1_line = f"CRYST1{lx:9.3f}{ly:9.3f}{lz:9.3f}  90.00  90.00  90.00 P 1           1\n"
+        lines.append(cryst1_line)
 
     for bi, bead in enumerate(bead_defs):
         x, y, z = positions_frame[bi]
@@ -399,6 +404,7 @@ def build_universal_cg_outputs(topology_path, trajectory_path, mapping_rules, fr
         output_path=project_dir / "cg_start.pdb",
         bead_defs=bead_defs,
         positions_frame=positions[frame_index],
+        box_dimensions=box_lengths[frame_index],
         mapping_rules=mapping_rules,
         conect=True,
     )
