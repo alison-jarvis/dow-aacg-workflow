@@ -1,3 +1,3 @@
 #!/bin/sh
 
-docker run --rm -it -v $(pwd):/repo capstone/smiles
+sudo apptainer run --nvccli smiles.sif
