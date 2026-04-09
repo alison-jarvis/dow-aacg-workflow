@@ -1,0 +1,34 @@
+Bootstrap: docker
+From: mambaorg/micromamba
+
+# 1. Define the argument with a safe fallback
+%arguments
+    CUDA_VER=""
+
+%files
+    environment.yml /environment.yml
+    entrypoint.sh /entrypoint.sh
+
+%post
+    export MAMBA_ROOT_PREFIX=/opt/conda
+
+    # 2. Inject the dynamically detected version from your host
+    export CONDA_OVERRIDE_CUDA="{{ CUDA_VER }}"
+    echo "Forcing Conda to use CUDA Version: $CONDA_OVERRIDE_CUDA"
+    
+    # 3. Install directly into the base environment
+    micromamba install -y -n base -f /environment.yml
+    micromamba clean --all --yes
+    
+    chmod +x /entrypoint.sh
+
+%environment
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PATH="/opt/conda/bin:$PATH"
+
+%runscript
+    if [ $# -eq 0 ]; then
+        exec micromamba run -n base /entrypoint.sh /bin/bash
+    else
+        exec micromamba run -n base /entrypoint.sh "$@"
+    fi

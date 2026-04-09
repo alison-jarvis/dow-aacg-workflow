@@ -1,6 +1,6 @@
 from aamd_utils import *
 from BoxPacker import BoxPacker
-from cg_build import build_cg_outputs
+from cg_build import build_cg_outputs, build_universal_cg_outputs
 
 class AllAtomSimulation():
 
@@ -28,6 +28,7 @@ class AllAtomSimulation():
         # Initialize a box packer class, and pack with packmol
         box_pack = BoxPacker(self.system_config_path, overwrite=True, filename = self.identifier)
         box_pack.pack_the_mol()
+        self.mapping_rules = box_pack.mapping_rules
 
     def generate_topology(self):
         # Generate the topology object, molecules, and positions
@@ -69,5 +70,5 @@ class AllAtomSimulation():
 
         if run_cg:
             print("Running coarse-graining build...")
-            build_cg_outputs(topology_path, trajectory_path, frame_index=cg_frame_index)
+            build_universal_cg_outputs(topology_path, trajectory_path, self.mapping_rules, frame_index=cg_frame_index)
             print("CG build completed.")
