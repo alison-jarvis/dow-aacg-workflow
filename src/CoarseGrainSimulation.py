@@ -13,6 +13,7 @@ from sys import stdout
 import itertools
 import pandas as pd
 import numpy as np
+import csv
 
 class CoarseGrainSimulation():
 
@@ -161,7 +162,7 @@ class CoarseGrainSimulation():
 
         if save_diagnostics:
             log_path = f"{diag_dir}/cg_log_{iteration_number}.txt"
-            simulation.reporters.append(StateDataReporter(log_path, report_interval, step=True, temperature=True, potentialEnergy=True, density=True, volume=True))
+            simulation.reporters.append(StateDataReporter(log_path, report_interval, step=True, temperature=True, potentialEnergy=True, kineticEnergy=True, totalEnergy=True, density=True, volume=True))
 
         print(f"Running production for iteration {iteration_number}...")
         simulation.step(prod_steps)
@@ -326,6 +327,21 @@ class CoarseGrainSimulation():
         df.to_csv(output_path, index=False)
         print(f"\nSaved final RDFs to {output_path}")
 
+    def write_parameters_to_csv(self, output_path = "final_parameters.csv"):
+        full_output_path = self.project_name + "/" + output_path
+
+        # Iterate through parameters and save
+        parameters = [["bead_type", "gamma", "a"]]
+        for bead_type in self.bead_params.keys():
+            gamma = self.bead_params[bead_type][0]
+            a = self.bead_params[bead_type][1]
+            parameters.append([bead_type, gamma, a])
+
+        # Write to file
+        with open(full_output_path, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerows(parameters)
+
     def optimize(self, iterations=50, threshold = 0.05):
         """
         The master loop that iterates the Gaussian system toward the target RDFs.
@@ -337,6 +353,13 @@ class CoarseGrainSimulation():
             initial_gamma = self.general_config["default parameter 1"]
             initial_a = self.general_config["default parameter 2"]
             self.bead_params = build_bead_params_srel(self.topology, initial_gamma, initial_a)
+
+        # Create directory for parameters
+        parameter_directory = self.project_name + "/cg_parameters/"
+        os.makedirs(parameter_directory, exist_ok=True)
+
+        # Create list to save rdf error values
+        rdf_errors = [["Iteration", "RDF Error"]]
 
         # 3. The Loop
         for i in range(iterations):
@@ -352,11 +375,35 @@ class CoarseGrainSimulation():
             self.current_rdfs = self.calculate_current_rdfs(iteration_number=i)
             current_error = self.calculate_rdf_error(self.target_rdfs, self.current_rdfs)
 
+            # Write a line for the rdf error
+            rdf_errors.append([i, current_error])
+
+            # Write parameters to csv
+            parameter_path = "cg_parameters/cg_params_" + str(i) + ".csv"
+            self.write_parameters_to_csv(output_path = parameter_path)
+
             if current_error <= threshold:
+                # First, write out rdf errors
+                rdf_csv_path = self.project_name + "/rdf_errors.csv"
+                with open(rdf_csv_path, "w", newline="") as file:
+                    writer = csv.writer(file)
+                    writer.writerows(rdf_errors)
+                # Second, write out final parameters
+                self.write_parameters_to_csv()
                 print(f"Convergence threshold reached after {i} iterations")
                 break
             # Adjust the parameters for the next loop
             self.update_gaussian_parameters(self.target_rdfs, self.current_rdfs)
             
+        # Write out the files if convergence was never achieved
+        # First, write out rdf errors
+        rdf_csv_path = self.project_name + "/rdf_errors.csv"
+        with open(rdf_csv_path, "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerows(rdf_errors)
+        # Second, write out final parameters
+        self.write_parameters_to_csv()
+
+        # Finalize
         print("Optimization completed.")
         self.export_rdfs_to_csv(self.target_rdfs, self.current_rdfs)
