@@ -19,6 +19,9 @@ From: mambaorg/micromamba
     # 3. Install directly into the base environment
     micromamba install -y -n base -f /environment.yml
     micromamba clean --all --yes
+
+    # 4. Install isolated OpenMSCG stack
+    micromamba create -y -n mscg_engine -c vothgroup -c defaults openmscg python=3.8
     
     chmod +x /entrypoint.sh
 

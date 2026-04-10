@@ -18,4 +18,4 @@ if __name__ == '__main__':
     cgsim = CoarseGrainSimulation(system_config_path, general_config_path)
 
     # Run a simulation
-    cgsim.optimize()
+    cgsim.optimize(iterations=100)
