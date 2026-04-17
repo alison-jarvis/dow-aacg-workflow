@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import mdtraj as md
 import nglview as nv
 from pathlib import Path
+import json
 
 ################### Utility Functions #####################
 
@@ -51,13 +52,14 @@ def steps_from_ns(time_ns, timestep_fs):
     time_fs = time_ns * 1e6
     return int(time_fs / timestep_fs)
 
-def parse_general_config(config_path):
+def parse_general_config(config_path, with_forcefield=False):
     """
     Parse information from the general config file, return as dictionary
     """
     config_dict = {}
 
     with open(config_path, "r") as f:
+        ff_params_dict = None
         for line in f:
             line = line.strip()
             if not line or ":" not in line:
@@ -65,20 +67,34 @@ def parse_general_config(config_path):
 
             left, value = line.split(":", 1)
             key = left.split(",")[0].strip()
-            value = value.strip()
+            if not key == "cg ff parameters":
+                value = value.strip()
 
-            # Convert numeric values automatically
-            try:
-                value = float(value)
-            except ValueError:
-                pass  # keep as string
+                # Convert numeric values automatically
+                try:
+                    value = float(value)
+                except ValueError:
+                    pass  # keep as string
 
-            if value == 'None' or value == 'none':
-                value = None
+                if value == 'None' or value == 'none':
+                    value = None
 
-            config_dict[key] = value
+                config_dict[key] = value
+            else:
+                # Find the index of the first opening curly brace to separate the prefix from the json
+                json_start_index = line.find('{')
 
-    return config_dict
+                if json_start_index != -1:
+                    # Slice the string from the first '{' to the end
+                    json_string = line[json_start_index:]
+                    
+                    # Parse the json string into a Python dictionary
+                    ff_params_dict = json.loads(json_string)
+
+    if with_forcefield:
+        return config_dict, ff_params_dict
+    else:
+        return config_dict
 
 def plot_diagnostics(log_path, project_name):
     # Check if a plots folder exists in the project

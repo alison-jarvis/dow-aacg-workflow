@@ -1,38 +1,370 @@
 # Imports
-from openmm.app import PDBFile
-from openmm import CustomNonbondedForce, HarmonicBondForce
-from openmm import System
-from aamd_utils import *
-from openmm.unit import dalton, nanometer, kelvin
-from openmm.unit import BOLTZMANN_CONSTANT_kB
-from openmm.unit import MOLAR_GAS_CONSTANT_R
-from openmm.unit import picosecond, femtoseconds, bar
-from openmm import LangevinIntegrator
-from openmm.app import Simulation, PDBReporter, DCDReporter, StateDataReporter
-from openmm import MonteCarloBarostat
-from openmm.unit import norm
+import os
+import numpy as np
+import itertools
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 from sys import stdout
+from openmm.unit import *
+from openmm.app import Simulation, DCDReporter, StateDataReporter
+from openmm import CustomNonbondedForce, Discrete2DFunction, CustomBondForce
+from openmm import System, MonteCarloBarostat, LangevinIntegrator
+from aamd_utils import *
 
-# Helper function, get bead types from topology object
-def get_bead_types(topology):
-    bead_types = sorted({atom.name for atom in topology.atoms()})
-    return bead_types
 
-# Helper function, get dictionary of bead : gamma / a for nonbonded force
-def build_bead_params_srel(topology, initial_gamma, initial_a):
+############### Parameter Handling Utils ##################
 
-    bead_types = get_bead_types(topology)
-    bead_type_params = {}
+# Pair key type
+PairKey = Tuple[str, str]
 
-    for bead in bead_types:
-        bead_type_params[bead] = [initial_gamma, initial_a]
+# Defines the unique bead ID for an atom
+def bead_type_id(atom) -> str:
+    return f"{atom.residue.name.strip()}_{atom.name.strip()}"
 
-    return bead_type_params
+# Enforces ordering of bead ID pairs for consistency
+def canonical_pair(a: str, b: str) -> PairKey:
+    return tuple(sorted((a, b)))
 
-# Function to create coarse grained system
-def create_cg_system(topology, positions, project_name, identifier, general_config, temperature):
+# Get set of unique bead types for a topology
+def get_unique_bead_types(topology):
+    return sorted({bead_type_id(atom) for atom in topology.atoms()})
 
-    # Create the system
+# Get set of unique pairs for a topology
+def get_all_type_pairs(topology):
+    bead_types = get_unique_bead_types(topology)
+    return [canonical_pair(a, b) for a, b in itertools.combinations_with_replacement(bead_types, 2)]
+
+# Get set of unique bonded pairs for a topology
+def get_bonded_type_pairs(topology):
+    bonded_pairs = set()
+    for bond in topology.bonds():
+        bt_i = bead_type_id(bond[0])
+        bt_j = bead_type_id(bond[1])
+        bonded_pairs.add(canonical_pair(bt_i, bt_j))
+    return sorted(bonded_pairs)
+
+# Get mapping of bead ID to bead mass from topology
+def extract_bead_mass_mapping(topology):
+    """TO DO: IMPLEMENT"""
+    bead_masses = dict()
+    for atom in topology.atoms():
+        unique_id = bead_type_id(atom)
+        bead_masses[unique_id] = 54
+    return bead_masses
+
+
+################# Parameter Object ##################
+
+@dataclass
+class ParameterSet:
+    pair_names: List[str]
+    individual_names: List[str]
+    fixed_names: List[str]
+
+    # Pair parameters - dictionary of parameter name : bead pair, default value
+    pair_parameters: Dict[str, Dict[PairKey, float]] = field(default_factory=dict)
+
+    # Individual parameters - dictionary of parameter name : bead name, default value
+    individual_parameters: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    # Fixed parameters - dictionary of parameter name : default value
+    fixed_parameters: Dict[str, object] = field(default_factory=dict)
+
+    ########### Functions for ease of class use ############
+    def get_pair(self, pair: PairKey, name: str) -> float:
+        return self.pair_parameters[name][canonical_pair(*pair)]
+
+    def set_pair(self, pair: PairKey, name: str, value: float) -> None:
+        self.pair_parameters[name][canonical_pair(*pair)] = value
+
+    def has_pair(self, pair: PairKey, name: str) -> bool:
+        return canonical_pair(*pair) in self.pair_parameters.get(name, {})
+
+    def get_individual(self, bead_type: str, name: str) -> float:
+        return self.individual_parameters[name][bead_type]
+
+    def set_individual(self, bead_type: str, name: str, value: float) -> None:
+        self.individual_parameters[name][bead_type] = value
+
+    def has_individual(self, bead_type: str, name: str) -> bool:
+        return bead_type in self.individual_parameters.get(name, {})
+
+    def get_fixed(self, name: str):
+        return self.fixed_parameters[name]
+
+    def set_fixed(self, name: str, value) -> None:
+        self.fixed_parameters[name] = value
+
+    # Update parameter object from calculated gradient values
+    def apply_gradients(self, gradients, learning_rate):
+        """
+        Parameters
+        ----------
+        gradients : dict
+            Dictionary of parameter type : {name : gradient value}
+        learning_rate : float
+            For basic gradient descent, update as theta_new = theta - lr * grad
+        """
+
+        # Pairwise parameters
+        for pname, param_dict in gradients["pair"].items():
+            for key, grad in param_dict.items():
+                value = self.pair_parameters[pname][key] - learning_rate * grad
+                self.pair_parameters[pname][key] = max(value, 1e-6)
+
+        # Individual parameters
+        for pname, param_dict in gradients["individual"].items():
+            for key, grad in param_dict.items():
+                value = self.individual_parameters[pname][key] - learning_rate * grad
+                self.individual_parameters[pname][key] = max(value, 1e-6)
+
+        # Fixed parameters
+        for pname, grad in gradients["fixed"].items():
+            continue
+            # Placeholder until we figure out how to add a true constant to the ff, don't update kbt
+            value = self.fixed_parameters[pname] - learning_rate * grad
+            self.fixed_parameters[pname] = max(value, 1e-6)
+
+############## ForceField Object ##################
+
+@dataclass
+class ForceSpec:
+    ######### Attributes ##############
+    nonbonded_expression: Optional[str] = None
+    bonded_expression: Optional[str] = None
+
+    nonbonded_pair_names: List[str] = field(default_factory=list)
+    nonbonded_individual_names: List[str] = field(default_factory=list)
+    nonbonded_fixed_names: List[str] = field(default_factory=list)
+
+    bonded_pair_names: List[str] = field(default_factory=list)
+    bonded_individual_names: List[str] = field(default_factory=list)
+    bonded_fixed_names: List[str] = field(default_factory=list)
+
+
+############# Config Parsing Utils #################
+
+# Parse parameter from the config file
+def parse_parameters_from_config(parameter_config, topology, temperature):
+    """
+    Load parameters from config file into Parameter object
+    Parameter Categories:
+    - Nonbonded
+        - Pairwise
+        - Individual
+        - Fixed
+    - Bonded
+        - Pairwise
+        - Individual
+        - Fixed
+    """
+
+    # Initialize objects to fill
+    pair_names = []
+    individual_names = []
+    fixed_names = []
+
+    pair_parameters = {}
+    individual_parameters = {}
+    fixed_parameters = {}
+
+    all_bead_types = get_unique_bead_types(topology)
+    all_type_pairs = get_all_type_pairs(topology)
+    bonded_type_pairs = get_bonded_type_pairs(topology)
+
+    ############ Non-bonded Parameters #############
+    if "nonbonded" in parameter_config:
+        for pname, spec in parameter_config["nonbonded"].items():
+            ptype = spec["type"]
+            default = spec["default"]
+
+            if ptype == "pairwise":
+                pair_names.append(pname)
+                pair_parameters[pname] = {pair: float(default) for pair in all_type_pairs}
+
+            elif ptype == "individual":
+                individual_names.append(pname)
+                individual_parameters[pname] = {bead_type: float(default) for bead_type in all_bead_types}
+
+            elif ptype == "fixed":
+                fixed_names.append(pname)
+                fixed_parameters[pname] = default
+
+            else:
+                raise ValueError(f"Unknown parameter type '{ptype}' for '{pname}'")
+
+    ########### Bonded Parameters #############
+    if "bonded" in parameter_config:
+        for pname, spec in parameter_config["bonded"].items():
+            ptype = spec["type"]
+            default = spec["default"]
+
+            if ptype == "pairwise":
+                if pname not in pair_names:
+                    pair_names.append(pname)
+                pair_parameters[pname] = {pair: float(default) for pair in bonded_type_pairs}
+
+            elif ptype == "individual":
+                if pname not in individual_names:
+                    individual_names.append(pname)
+                individual_parameters[pname] = {bead_type: float(default) for bead_type in all_bead_types}
+
+            elif ptype == "fixed":
+                if pname not in fixed_names:
+                    fixed_names.append(pname)
+                fixed_parameters[pname] = default
+
+            else:
+                raise ValueError(f"Unknown parameter type '{ptype}' for '{pname}'")
+            
+    # Add boltzmann constant as a fixed parameter
+    kBT = MOLAR_GAS_CONSTANT_R * temperature * kelvin
+    if "kBT" not in fixed_names:
+        fixed_names.append("kBT")
+    fixed_parameters["kBT"] = kBT
+
+    ps = ParameterSet(pair_names=pair_names, individual_names=individual_names, 
+                      fixed_names=fixed_names, pair_parameters=pair_parameters,
+                      individual_parameters=individual_parameters, fixed_parameters=fixed_parameters)
+    return ps
+
+# Parse forcefield parameters from config
+def parse_forcefield_from_config(general_config):
+    """TO DO: GENERALIZE"""
+    ff = None
+    if general_config["cg forcefield"] == "srel":
+        ff = ForceSpec(nonbonded_expression="sqrt(gamma(type1,type2))*exp(-r^2/(2*(a1*a1 + a2*a2)))",
+                       bonded_expression="(3/(2*b*b))*r^2",
+                       
+                       nonbonded_pair_names=["gamma"],
+                       nonbonded_individual_names=["a"],
+                       nonbonded_fixed_names=[],
+                       
+                       bonded_pair_names=["b"],
+                       bonded_individual_names=[],
+                       bonded_fixed_names=["kBT"])
+    return ff
+
+############### ForceField Utils ################
+
+# Build a custom nonbonded force from parameters and forcefield
+def build_nonbonded_force(topology, parameter_set: ParameterSet, force_spec: ForceSpec, cutoff_nm: float):
+    """Custom nonbonded openmm force object"""
+
+    # Parse unique bead types from either parameters or topology
+    bead_types = sorted(next(iter(parameter_set.individual_parameters.values())).keys()) \
+        if parameter_set.individual_parameters else get_unique_bead_types(topology)
+
+    # Map the bead indices to types
+    type_index_map = {bt: i for i, bt in enumerate(bead_types)}
+    n_types = len(bead_types)
+
+    # Define a custom nonbonded force with the expression
+    force = CustomNonbondedForce(force_spec.nonbonded_expression)
+
+    # Add type as per-particle parameter, so type is indexed by i, j
+    force.addPerParticleParameter("type")
+
+    # Add individual parameters as per particle parameters
+    for name in force_spec.nonbonded_individual_names:
+        force.addPerParticleParameter(name)
+
+    # Add fixed parameters, which are globals (not bead specific)
+    for name in force_spec.nonbonded_fixed_names:
+        force.addGlobalParameter(name, parameter_set.get_fixed(name))
+
+    # For each nonbonded parameter name, initialize table of bead type pairs
+    for pname in force_spec.nonbonded_pair_names:
+        table = np.zeros((n_types, n_types), dtype=float)
+        for ti, bt_i in enumerate(bead_types):
+            for tj, bt_j in enumerate(bead_types):
+                table[ti, tj] = parameter_set.get_pair((bt_i, bt_j), pname)
+
+        # Add tabulated function representing pair-parameters to force
+        pname_as_function = Discrete2DFunction(n_types, n_types, table.flatten().tolist())
+        force.addTabulatedFunction(pname, pname_as_function)
+
+    # Add particles to force with default values of individual parameters
+    for atom in topology.atoms():
+        bt = bead_type_id(atom)
+        values = [float(type_index_map[bt])]
+        for name in force_spec.nonbonded_individual_names:
+            values.append(parameter_set.get_individual(bt, name))
+        force.addParticle(values)
+
+    # Set periodic cutoff for this force
+    force.setNonbondedMethod(CustomNonbondedForce.CutoffPeriodic)
+    force.setCutoffDistance(cutoff_nm * nanometer)
+
+    # Exclude bonded particles from nonbonded force
+    bonds = [(bond[0].index, bond[1].index) for bond in topology.bonds()]
+    force.createExclusionsFromBonds(bonds, 1)
+
+    return force
+
+
+# Build a custom openmm bonded force objcet
+def build_bonded_force(topology, parameter_set: ParameterSet, force_spec: ForceSpec):
+    """Custom bonded force from parameters and forcefield"""
+
+    # Create custom bonded force from expression
+    force = CustomBondForce(force_spec.bonded_expression)
+
+    # Add per-bond parameter names to force (pair names)
+    for name in force_spec.bonded_pair_names:
+        force.addPerBondParameter(name)
+
+    # Add per bead parameters to force (individual names), called 1 and 2
+    for name in force_spec.bonded_individual_names:
+        force.addPerBondParameter(f"{name}1")
+        force.addPerBondParameter(f"{name}2")
+
+    # Add fixed global parameters to force
+    for name in force_spec.bonded_fixed_names:
+        force.addGlobalParameter(name, parameter_set.get_fixed(name))
+
+    # Iterate through bonds
+    for bond in topology.bonds():
+        # Indices of bond pair
+        i = bond[0].index
+        j = bond[1].index
+
+        # Get i / j bead IDs and pair ID
+        bt_i = bead_type_id(bond[0])
+        bt_j = bead_type_id(bond[1])
+        pair = canonical_pair(bt_i, bt_j)
+
+        # Net values to add to bond
+        values = []
+
+        # Append pairwise parameters to values for this bond
+        for name in force_spec.bonded_pair_names:
+            if not parameter_set.has_pair(pair, name):
+                raise KeyError(f"Missing bonded pair parameter '{name}' for pair {pair}")
+            values.append(parameter_set.get_pair(pair, name))
+
+        # Append individual parameters to values for this bond
+        for name in force_spec.bonded_individual_names:
+            if not parameter_set.has_individual(bt_i, name):
+                raise KeyError(f"Missing individual bonded parameter '{name}' for bead type {bt_i}")
+            if not parameter_set.has_individual(bt_j, name):
+                raise KeyError(f"Missing individual bonded parameter '{name}' for bead type {bt_j}")
+            values.append(parameter_set.get_individual(bt_i, name))
+            values.append(parameter_set.get_individual(bt_j, name))
+
+        # Add this bond to the force
+        force.addBond(i, j, values)
+
+    return force
+
+# Build a generalized coarse grained system from parameter / force
+def build_general_cg_system(topology, project_name, identifier, masses, parameter_set: ParameterSet,
+                            force_spec: ForceSpec, general_config: Dict):
+    
+    # Define the cutoff from the general config file
+    cutoff_nm = general_config["cg interaction cutoff"]
+
+    # Initialize a system
     system = System()
 
     # Set periodic box vectors (same as AA system)
@@ -41,143 +373,90 @@ def create_cg_system(topology, positions, project_name, identifier, general_conf
     box_vectors = parse_packmol_box(inp_path, pbc_margin=pbc_margin)
     system.setDefaultPeriodicBoxVectors(box_vectors[0], box_vectors[1], box_vectors[2])
 
-    # Add particles to system
+    # Iterate through atoms in topology and add the particle to the system
     for atom in topology.atoms():
-        # UPDATE - add particle requires bead mass. Should be from universal CG mapping. 
-        system.addParticle(54*dalton) # Placeholder bead mass right now (mass of 3 water molecules)
+        bt = bead_type_id(atom)
+        system.addParticle(masses[bt] * dalton)
 
-    ######## Option 1 - Srel #############
-    if general_config["cg forcefield"] == "srel":
+    # Add the nonbonded force to the system
+    if force_spec.nonbonded_expression is not None:
+        nonbonded_force = build_nonbonded_force(topology, parameter_set, force_spec, cutoff_nm)
+        system.addForce(nonbonded_force)
 
-        ############# Non-Bonded #############
-
-        # We define an openMM custom non-bonded force for this gaussian potential
-        gaussian_force = CustomNonbondedForce("""sqrt(gamma1*gamma2) * exp(-r^2 / (2*(a1*a1 + a2*a2)))""")
-
-        # Add the critical (iterative) parameters for this force
-        gaussian_force.addPerParticleParameter("gamma")
-        gaussian_force.addPerParticleParameter("a")
-
-        # Extract user defined values of these parameters for the system
-        gamma = general_config["default parameter 1"] # unitless
-        a = general_config["default parameter 2"] # nm
-
-        # Convert this into a parameter mapping dictionary based on beads in pdb
-        bead_param_mapping = build_bead_params_srel(topology, gamma, a)
-
-        # Set this force with a periodic cutoff and cutoff distance
-        gaussian_force.setNonbondedMethod(CustomNonbondedForce.CutoffPeriodic)
-        gaussian_force.setCutoffDistance(general_config["cg interaction cutoff"]*nanometer) # cutoff user defined, from config
-
-        # Add all the beads to the non-bonded force
-        for i, atom in enumerate(topology.atoms()):
-            bead_type = atom.name
-            gamma_bead, a_bead = bead_param_mapping[bead_type] # gamma and a specific to bead type
-            gaussian_force.addParticle([gamma_bead, a_bead]) # add these to foce
-
-        # Exclude bonded pairs for this force
-        bonds = [(bond[0].index, bond[1].index) for bond in topology.bonds()]
-        gaussian_force.createExclusionsFromBonds(bonds, 1)
-
-        # Add non-bonded force to system
-        system.addForce(gaussian_force)
-
-        ########### Bonded ##############
-
-        # We implement this with a general harmonic bond force
-        bond_force = HarmonicBondForce()
-
-        # Extract the user defined starting value of b from the config
-        b = general_config["default parameter 3"]*nanometer # nm
-
-        # Calculate the effective spring constant from b
-        kBT = MOLAR_GAS_CONSTANT_R * temperature * kelvin # boltzmann constant (function of temperature)
-        k = 3*kBT/(b**2)
-
-        # Iterate through all bonds, add bond force specifically for these indices
-        for bond in topology.bonds():
-            i = bond[0].index
-            j = bond[1].index
-
-            # Calculate distance between particles
-            delta = positions[i] - positions[j]
-            r0 = norm(delta)
-
-            # Add this bond with initial distance to bond force
-            bond_force.addBond(i, j, r0, k)
-
-        # Add force to system
-        system.addForce(bond_force)
+    # Add the bonded force to the system
+    if force_spec.bonded_expression is not None:
+        bonded_force = build_bonded_force(topology, parameter_set, force_spec)
+        system.addForce(bonded_force)
 
     return system
 
 
-def run_cg_simulation(topology, positions, system, general_config, project_name, temperature, simulation_type, pressure, iteration_number=0, save_diagnostics=True):
-    # Define Langevin Integrator (temperature, friction, timestep)
-    integrator = LangevinIntegrator(temperature, general_config["cg friction"]/picosecond, general_config["cg integration timestep"]*femtoseconds)
+################ CG Simulation Utils ################
 
-    # If the system is NPT, set a barostat
+# Function to run a simulation
+def run_cg_simulation(topology, positions, system, general_config, project_name, temperature, 
+                      simulation_type, pressure, iteration_number=0, save_diagnostics=True):
+    
+    # Folder management, make sure trajectories and diagnostics exist
+    traj_dir = f"./{project_name}/cg_trajectories/"
+    os.makedirs(traj_dir, exist_ok=True)
+    if save_diagnostics:
+        diag_dir = f"./{project_name}/cg_diagnostics/"
+        os.makedirs(diag_dir, exist_ok=True)
+
+    # Define a langevin integrator with temperature, friction, and timestep
+    integrator = LangevinIntegrator(temperature, 
+        general_config["cg friction"]/picosecond, 
+        general_config["cg integration timestep"]*femtoseconds)
+
+    # Special case for NPT simulation, add barostat
     if simulation_type == "NPT":
-        barostat_frequency_steps = steps_from_ns(general_config["cg pressure enforcing frequency"], general_config["cg integration timestep"])
-        barostat = MonteCarloBarostat(pressure * bar, temperature, barostat_frequency_steps)
+        barostat_freq = steps_from_ns(general_config["cg pressure enforcing frequency"], general_config["cg integration timestep"])
+        barostat = MonteCarloBarostat(pressure * bar, temperature, barostat_freq)
         system.addForce(barostat)
 
-    # Define simulation object and set positions
+    # Define a simulation object, set positions
     simulation = Simulation(topology, system, integrator)
     simulation.context.setPositions(positions)
 
-    # Minimize the system energy
-    print("Minimizing system")
+    # Minimize the energy of the system
+    print(f"Minimizing system for iteration {iteration_number}...")
     simulation.minimizeEnergy()
 
-    # Get necessary config params to calculate step intervals
+    # Calculate step / reporting quantities from config
     timestep_fs = general_config["cg integration timestep"]
-    equil_time_ns = general_config["cg equilibration time"]
-    prod_time_ns = general_config["cg production time"]
-    traj_freq_ns = general_config["cg trajectory log frequency"]
+    equil_steps = compute_md_steps(general_config["cg equilibration time"], timestep_fs)
+    prod_steps = compute_md_steps(general_config["cg production time"], timestep_fs)
+    report_interval = compute_report_interval(general_config["cg trajectory log frequency"], timestep_fs)
 
-    # Calculate step quantities for equilibration, production, and reporting
-    equil_steps = compute_md_steps(equil_time_ns, timestep_fs)
-    prod_steps = compute_md_steps(prod_time_ns, timestep_fs)
-    report_interval = compute_report_interval(traj_freq_ns, timestep_fs)
-
-    ########## Equilibration #############
-
-    # Option 1 - NVT
+    # Equilibrate the system
     if simulation_type == "NVT":
-        # For NVT, only run at equilibrium at temperature
-        print("Equilibrating system")
         simulation.context.setVelocitiesToTemperature(temperature)
         simulation.step(equil_steps)
-    # Option 2 - NPT
     elif simulation_type == "NPT":
-        # For NPT, first do a small NVT equilibration
-        print("Short system equilibration with NVT")
         simulation.context.setVelocitiesToTemperature(temperature)
-        simulation.context.setParameter(MonteCarloBarostat.Pressure(), 0 * bar) # temporarily set barostat off
-        nvt_equil_steps = steps_from_ps(100.0, general_config["cg integration timestep"])
-        simulation.step(nvt_equil_steps) # total 100 ps, constant (not in config)
-
-        # Set the barostat back on and perform full NPT equilibration
-        print("NPT equilibration and density relaxation")
-        simulation.context.setParameter(MonteCarloBarostat.Pressure(), pressure * bar) # set barostat back on
+        simulation.context.setParameter(MonteCarloBarostat.Pressure(), 0 * bar) 
+        simulation.step(steps_from_ps(100.0, timestep_fs))
+        simulation.context.setParameter(MonteCarloBarostat.Pressure(), pressure * bar) 
         simulation.context.setVelocitiesToTemperature(temperature)
         simulation.step(equil_steps)
 
-    ############# Production #############
+    # Set production reporters
+    traj_path = f"{traj_dir}/cgmd_trajectory_{iteration_number}.dcd"
+    simulation.reporters.append(DCDReporter(traj_path, report_interval))
+    simulation.reporters.append(StateDataReporter(stdout, 5000, step=True, temperature=True, density=True))
 
-    # Add reporters for production
-    simulation_trajectory_path = project_name + '/cg_trajectories/cgmd_trajectory_' + str(iteration_number) + '.dcd'
-    simulation.reporters.append(DCDReporter(simulation_trajectory_path, report_interval))
-    simulation.reporters.append(StateDataReporter(stdout, 5000, step=True, temperature=True, density=True)) # another constant, always prints out at frequency of 5000 steps
-
+    # Define reporter if saving diagnostics
     if save_diagnostics:
-        log_path = project_name + '/cg_diagnostics/cg_log_' + str(iteration_number) + '.txt'
-        print(f"Reported quantities from CG simulation (T, E, \u03C1, V) will be written to the file: {log_path}")
-        simulation.reporters.append(StateDataReporter(log_path, report_interval, step=True, temperature=True, 
-                                                      potentialEnergy=True, kineticEnergy=True, totalEnergy=True, 
-                                                      density=True, volume=True))
+        log_path = f"{diag_dir}/cg_log_{iteration_number}.txt"
+        simulation.reporters.append(StateDataReporter(log_path, report_interval, step=True,
+                                                       temperature=True, potentialEnergy=True, 
+                                                       kineticEnergy=True, totalEnergy=True, 
+                                                       density=True, volume=True))
 
     # Run production
-    print("Running production")
+    print(f"Running production for iteration {iteration_number}...")
     simulation.step(prod_steps)
+
+    # Return the final positions
+    return simulation.context.getState(getPositions=True).getPositions()
