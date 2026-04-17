@@ -1,8 +1,11 @@
 from rdkit import Chem
 from collections import deque
+import json
 
-def generate_auto_mapping(smiles : str, cg_resname = "MOL"):
+def generate_auto_mapping(smiles : str, cg_resname = "MOL", bead_size = 3, debug = False):
     """generates a CG mapping dict for any molecule using graph traversal"""
+    if bead_size <= 0:
+        raise ValueError(f"A bead size of {bead_size} is invalid. Please update the bead size.")
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Invalid SMILES string: {smiles}")
@@ -22,19 +25,22 @@ def generate_auto_mapping(smiles : str, cg_resname = "MOL"):
     num_heavy = len(heavy_atoms)
 
     #preassign expected bead sizes
-    if num_heavy <= 4:
+    if num_heavy <= bead_size + 1:
         target_sizes = [num_heavy]
-    elif num_heavy == 5:
-        target_sizes = [3, 2]
+    elif num_heavy < bead_size * 2:
+        target_sizes = [num_heavy // 2 + num_heavy % 2, num_heavy // 2]
     else:
-        target_sizes = [3] * (num_heavy // 3)
-        remainder = num_heavy % 3
+        target_sizes = [bead_size] * (num_heavy // bead_size)
+        remainder = num_heavy % bead_size
+        length = len(target_sizes)
 
-        if remainder == 1:
-            target_sizes[0] += 1
-        elif remainder == 2:
-            target_sizes[0] += 1
-            target_sizes[-1] += 1
+        for i in range(remainder):
+
+            offset = (i // 2) % length
+            if i % 2 == 0:
+                target_sizes[offset] += 1
+            else:
+                target_sizes[-1 - offset] += 1
 
     unassigned_heavy = set(a.GetIdx() for a in heavy_atoms)
     bead_chunks = []
@@ -49,7 +55,7 @@ def generate_auto_mapping(smiles : str, cg_resname = "MOL"):
         start_candidates = [i for i in unassigned_heavy if get_heavy_degree(mol.GetAtomWithIdx(i)) <= 1]
         start_idx = start_candidates[0] if start_candidates else list(unassigned_heavy)[0]
 
-        current_target = target_sizes.pop(0) if target_sizes else 3
+        current_target = target_sizes.pop(0) if target_sizes else bead_size
 
         current_chunk = []
         queue = deque([start_idx])
@@ -109,10 +115,16 @@ def generate_auto_mapping(smiles : str, cg_resname = "MOL"):
         
     bonds_output = sorted(list(cg_bonds_set))
 
-    return {
+    output_dict = {
         cg_resname: {
             "cg_resname" : cg_resname,
             "beads" : beads_output,
             "bonds" : bonds_output
         }
     }
+
+    if debug:
+        with open("bead_map.json", "w") as file:
+            json.dump(output_dict, file, indent = 4)
+
+    return output_dict
