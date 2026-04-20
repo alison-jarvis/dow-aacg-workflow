@@ -65,7 +65,7 @@ class CoarseGrainSimulation():
                                           save_diagnostics=save_diagnostics)
         
         # Save the final positions to update the starting point for the next iteration
-        #self.positions = new_positions
+        self.positions = new_positions
 
     def update_system(self):
         self.create_system()

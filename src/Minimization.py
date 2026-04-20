@@ -2,6 +2,7 @@ from CoarseGrainSimulation import CoarseGrainSimulation
 from aamd_utils import *
 from minimization_utils import *
 from BoxPacker import BoxPacker
+import csv
 
 class CG_AA_Minimizer():
 
@@ -60,74 +61,104 @@ class CG_AA_Minimizer():
                                                                      step=cg_step)
 
     def minimize(self):
-        # Read iterations, threshold and LR from config
         iterations = int(self.general_config["opt iterations"])
-        threshold = self.general_config["opt threshold"]
-        learning_rate = self.general_config["opt learning rate"]
+        threshold = float(self.general_config["opt threshold"])
+        learning_rate = float(self.general_config["opt learning rate"])
 
         print(f"=== Starting CG Parameter Optimization ({iterations} Iterations) ===")
 
-        # Create directory for parameters
         parameter_directory = self.project_name + "/cg_parameters/"
         os.makedirs(parameter_directory, exist_ok=True)
 
-        # Create list to save rdf error values
+        # Keep RDFs only as diagnostics
         rdf_errors = [["Iteration", "RDF Error"]]
+        srel_history = [["Iteration", "Gradient Norm"]]
+        h2o_grad_history = [["Iteration", "H2O_H2O_Gradient", "H2O_H2O_Gamma"]]
 
-        ########### Full Minimization Loop ##############
         for i in range(iterations):
             print(f"\n--- Iteration {i} ---")
 
-            # Run a simulation with the current cg object
+            # 1. Run CGMD with current parameters
             self.cg_sim.run_simulation(iteration_number=i, save_diagnostics=True)
 
-            # Load the current cg iteration after sim complete
+            # 2. Load current CG trajectory
             self.load_current_cg_iteration(i)
 
-            # Calculate rdfs from the simulation run
+            # 3. Compute Srel gradient
+            gradients = calculate_srel_gradients(
+                aa_positions=self.aa_positions,
+                cg_positions=self.cg_positions,
+                topology=self.cg_sim.topology,
+                parameter_set=self.cg_sim.parameters,
+                aa_boxes=self.aa_boxes,
+                cg_boxes=self.cg_boxes,
+                cutoff_nm=self.general_config["cg interaction cutoff"],
+                frame_stride=1
+            )
+
+            # Log water-water gradient and parameter
+            h2o_key = ('H2O_B1', 'H2O_B1')
+            h2o_grad = gradients["pair"]["gamma"].get(h2o_key, None)
+            h2o_gamma = self.cg_sim.parameters.pair_parameters["gamma"].get(h2o_key, None)
+            h2o_grad_history.append([i, h2o_grad, h2o_gamma])
+
+            # 4. Freeze a and bonded b for now
+            for key in gradients["individual"].get("a", {}):
+                gradients["individual"]["a"][key] = 0.0
+
+            for key in gradients["pair"].get("b", {}):
+                gradients["pair"]["b"][key] = 0.0
+
+            # 5. Compute scalar convergence metric
+            grad_norm = calculate_srel_gradient_norm(gradients)
+            srel_history.append([i, grad_norm])
+            print(f"Srel gradient norm: {grad_norm:.6e}")
+
+            # 6. Optional RDF diagnostic
             self.current_rdfs = calculate_current_rdfs(i, self.project_name)
             current_error = calculate_rdf_error(self.target_rdfs, self.current_rdfs)
-
-            # Write a line to the csv for the rdf error
             rdf_errors.append([i, current_error])
+            print(f"RDF diagnostic error: {current_error:.6e}")
 
-            # Write current parameters to csv file
+            # 7. Save current parameters
             write_intermediate_parameters(self.cg_sim.parameters, self.project_name, i)
 
-            ########## Case 1 - Converged ############
-            if (current_error < threshold) or (i > iterations):
-                if i <= iterations:
-                    print(f'Minimization converged in {i} iterations.')
+            # 8. Check convergence using Srel metric
+            if grad_norm < threshold:
+                print(f"Srel minimization converged in {i} iterations.")
                 break
 
-            ########## Case 2 - Not Converged ########
+            # 9. Apply parameter update
+            gamma_grads = gradients["pair"]["gamma"]
+            sorted_items = sorted(gamma_grads.items(), key=lambda kv: abs(kv[1]), reverse=True)
 
-            gradients = calculate_srel_gradients(aa_positions=self.aa_positions,
-                                                 cg_positions=self.cg_positions,
-                                                 topology=self.cg_sim.topology,
-                                                 parameter_set=self.cg_sim.parameters,
-                                                 aa_boxes=self.aa_boxes,
-                                                 cg_boxes=self.cg_boxes,
-                                                 cutoff_nm=self.general_config["cg interaction cutoff"],
-                                                 frame_stride=5)
+            print("Top 10 |gamma gradients|:")
+            for key, val in sorted_items[:10]:
+                old_val = self.cg_sim.parameters.pair_parameters["gamma"][key]
+                expected_delta = -learning_rate * val
+                print(f"{key}: grad={val:.6e}, gamma={old_val:.6e}, expected_delta={expected_delta:.6e}")
 
-            # Apply gradients to the parameter object
             self.cg_sim.parameters.apply_gradients(gradients, learning_rate)
 
-            # Update CG simulation object based on parameter difference
+            print("gamma sample after update:", list(self.cg_sim.parameters.pair_parameters["gamma"].items())[:3])
+
+            # 10. Rebuild/update OpenMM system
             self.cg_sim.update_system()
 
-        ########## Post Loop Finalization ############
-
-        # First, write out rdf errors
-        rdf_csv_path = self.project_name + "/rdf_errors.csv"
-        with open(rdf_csv_path, "w", newline="") as file:
+        # Finalization
+        with open(self.project_name + "/rdf_errors.csv", "w", newline="") as file:
             writer = csv.writer(file)
             writer.writerows(rdf_errors)
 
-        # Second, write out final parameters
+        with open(self.project_name + "/srel_gradient_norms.csv", "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerows(srel_history)
+
+        with open(self.project_name + "/h2o_h2o_gradients.csv", "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerows(h2o_grad_history)
+
         write_final_parameters(self.cg_sim.parameters, self.project_name)
 
-        # Print finalize and write out final rdfs
         print("Optimization completed.")
         export_rdfs_to_csv(self.target_rdfs, self.current_rdfs, self.project_name)

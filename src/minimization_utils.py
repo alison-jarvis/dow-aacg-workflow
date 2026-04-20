@@ -1,4 +1,3 @@
-# Imports
 import pandas as pd
 import numpy as np
 import MDAnalysis as mda
@@ -7,6 +6,8 @@ from openmm.unit import kilojoule_per_mole
 import itertools
 from cg_build import *
 from cgmd_utils import *
+import os
+import csv
 
 
 ############### RDF Utils #################
@@ -171,7 +172,7 @@ def init_gradient_dict(parameter_set):
 def accumulate_nonbonded_srel(positions, boxes, topology, parameter_set, bead_types_by_index, frame_stride, cutoff_nm = None):
     """
     Accumulate ensemble averages of nonbonded derivatives for srel force
-    U = sqrt(gamma) * exp(-r^2 / (2*(a1^2 + a2^2)))
+    U = gamma * exp(-r^2 / (2*(a1^2 + a2^2)))
     """
     # Initialize gradient dict and sample count
     acc = init_gradient_dict(parameter_set)
@@ -253,14 +254,13 @@ def accumulate_nonbonded_srel(positions, boxes, topology, parameter_set, bead_ty
         # Intermediate terms for calculation
         D = a1_use * a1_use + a2_use * a2_use
         exp_term = np.exp(-(r_use * r_use) / (2.0 * D))
-        sqrt_gamma = np.sqrt(gamma_use)
 
-        # dU/dgamma = (1/(2*sqrt(gamma))) * exp(...)
-        d_gamma = 0.5 / sqrt_gamma * exp_term
+        # U = gamma * exp(...)
+        U = gamma_use * exp_term
 
-        # dU/da1 = U * r^2 * a1 / D^2
-        # dU/da2 = U * r^2 * a2 / D^2
-        U = sqrt_gamma * exp_term
+        # dU/dgamma = exp(...)
+        d_gamma = exp_term
+
         rr = r_use * r_use
         D2 = D * D
 
@@ -517,6 +517,29 @@ def map_aa_trajectory_to_cg_arrays(topology_path, trajectory_path, mapping_rules
     aa_boxes_nm = box_lengths_ang * 0.1
 
     return aa_positions_nm, aa_boxes_nm, bead_defs
+
+def flatten_gradient_dict(gradients):
+    vals = []
+
+    for pname in sorted(gradients["pair"].keys()):
+        for key in sorted(gradients["pair"][pname].keys()):
+            vals.append(float(gradients["pair"][pname][key]))
+
+    for pname in sorted(gradients["individual"].keys()):
+        for key in sorted(gradients["individual"][pname].keys()):
+            vals.append(float(gradients["individual"][pname][key]))
+
+    for pname in sorted(gradients["fixed"].keys()):
+        vals.append(float(gradients["fixed"][pname]))
+
+    return np.array(vals, dtype=float)
+
+
+def calculate_srel_gradient_norm(gradients):
+    g = flatten_gradient_dict(gradients)
+    if g.size == 0:
+        return 0.0
+    return float(np.linalg.norm(g))
 
 
 ################ Csv Writing Utils ###################

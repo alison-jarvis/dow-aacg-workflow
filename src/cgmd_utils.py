@@ -110,13 +110,24 @@ class ParameterSet:
         for pname, param_dict in gradients["pair"].items():
             for key, grad in param_dict.items():
                 value = self.pair_parameters[pname][key] - learning_rate * grad
-                self.pair_parameters[pname][key] = max(value, 1e-6)
+
+                # gamma may be negative
+                if pname == "gamma":
+                    self.pair_parameters[pname][key] = value
+                else:
+                    # keep other pair params positive, e.g. b
+                    self.pair_parameters[pname][key] = max(value, 1e-6)
 
         # Individual parameters
         for pname, param_dict in gradients["individual"].items():
             for key, grad in param_dict.items():
                 value = self.individual_parameters[pname][key] - learning_rate * grad
-                self.individual_parameters[pname][key] = max(value, 1e-6)
+
+                # keep widths positive
+                if pname == "a":
+                    self.individual_parameters[pname][key] = max(value, 1e-6)
+                else:
+                    self.individual_parameters[pname][key] = value
 
         # Fixed parameters
         for pname, grad in gradients["fixed"].items():
@@ -230,19 +241,20 @@ def parse_parameters_from_config(parameter_config, topology, temperature):
 
 # Parse forcefield parameters from config
 def parse_forcefield_from_config(general_config):
-    """TO DO: GENERALIZE"""
     ff = None
     if general_config["cg forcefield"] == "srel":
-        ff = ForceSpec(nonbonded_expression="sqrt(gamma(type1,type2))*exp(-r^2/(2*(a1*a1 + a2*a2)))",
-                       bonded_expression="(3/(2*b*b))*r^2",
-                       
-                       nonbonded_pair_names=["gamma"],
-                       nonbonded_individual_names=["a"],
-                       nonbonded_fixed_names=[],
-                       
-                       bonded_pair_names=["b"],
-                       bonded_individual_names=[],
-                       bonded_fixed_names=["kBT"])
+        ff = ForceSpec(
+            nonbonded_expression="gamma(type1,type2)*exp(-r^2/(2*(a1*a1 + a2*a2)))",
+            bonded_expression="kBT*(3/(2*b*b))*r^2",
+
+            nonbonded_pair_names=["gamma"],
+            nonbonded_individual_names=["a"],
+            nonbonded_fixed_names=[],
+
+            bonded_pair_names=["b"],
+            bonded_individual_names=[],
+            bonded_fixed_names=["kBT"]
+        )
     return ff
 
 ############### ForceField Utils ################
