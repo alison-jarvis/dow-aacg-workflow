@@ -393,7 +393,8 @@ def build_universal_cg_outputs(topology_path, trajectory_path, mapping_rules, fr
     positions, box_lengths = compute_bead_positions(universe, bead_defs)
 
     #Group indices by bead type
-    bead_types = [b["unique_id"] for b in bead_defs]
+    #bead_types = [b["unique_id"] for b in bead_defs]
+    bead_types = [b["bead_type"] for b in bead_defs]
 
     type_to_indices = {}
     for i, bt in enumerate(bead_types):

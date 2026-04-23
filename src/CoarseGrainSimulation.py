@@ -26,7 +26,7 @@ class CoarseGrainSimulation():
         # Initialize the parameter object from the general config
         self.parameters = parse_parameters_from_config(ff_params, self.topology, self.temperature)
         # Initialize forcefield object from general config
-        self.forcefield_form = parse_forcefield_from_config(self.general_config)
+        self.forcefield_form = parse_forcefield_from_config(self.general_config, ff_params)
 
         # Set target radial distribution functions (beaded all atom rdfs)
         self.target_rdfs = pd.read_csv(f"{self.project_name}/cg_rdfs.csv")

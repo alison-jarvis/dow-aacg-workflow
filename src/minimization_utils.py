@@ -1,64 +1,106 @@
 # Imports
+import os
+import csv
 import pandas as pd
 import numpy as np
 import MDAnalysis as mda
 import MDAnalysis.transformations as trans
 from openmm.unit import kilojoule_per_mole
 import itertools
+from collections import defaultdict
 from cg_build import *
 from cgmd_utils import *
 
 
 ############### RDF Utils #################
 
+# Helper - RDF bead type labels
+def current_rdf_bead_type(atom, mapping_rules=None):
+    """
+    Recover the CG bead type label used in target RDF generation, to replicate
+
+    Parameters
+    ----------
+    atom : MDAnalysis atom
+    mapping_rules : dict or None
+        Same rules used in build_universal_bead_mapping()
+
+    Returns
+    -------
+    bead_type : str
+    """
+    resname = atom.resname.strip()
+    atomname = atom.name.strip()
+
+    # Best / general path: use mapping rules
+    if mapping_rules is not None:
+        for _, rule in mapping_rules.items():
+            cg_resname = rule.get("cg_resname", "")[:3]
+
+            if cg_resname != resname:
+                continue
+
+            for bead_rule in rule["beads"]:
+                if bead_rule["name"] == atomname:
+                    return bead_rule["type"]
+
+    # Fallbacks for older / hardcoded systems
+    if resname == "WAT":
+        return "WAT"
+    if resname == "DIO":
+        return "DIO"
+    if resname == "DOD" and atomname.startswith("B"):
+        # B1 -> D1, B2 -> D2, ...
+        return f"D{atomname[1:]}"
+
+    # Last fallback: just use residue name
+    return resname
+
 # Calculate rdfs for the current step
-def calculate_current_rdfs(iteration_number, project_name):
-    #import current trajectory, topology
+def calculate_current_rdfs(iteration_number, project_name, mapping_rules=None):
+    # Load in current trajectory, topology
     trajectory_path = f"{project_name}/cg_trajectories/cgmd_trajectory_{iteration_number}.dcd"
     topology_path = f"{project_name}/cg_start.pdb"
 
-    #generate universe
     print(f"  -> Calculating RDFs for Iteration {iteration_number}...")
     u = mda.Universe(topology_path, trajectory_path)
 
-    #generate rdf labels
-    bead_ids = [f"{atom.resname.strip()}_{atom.name.strip()}" for atom in u.atoms]
+    # Generate bead-type labels consistent with target RDF generation
+    bead_ids = [current_rdf_bead_type(atom, mapping_rules) for atom in u.atoms]
 
     type_to_indices = {}
     for i, b_id in enumerate(bead_ids):
         type_to_indices.setdefault(b_id, []).append(i)
-        
-    unique_bead_ids = list(type_to_indices.keys())
+
+    # Keep pair ordering deterministic
+    unique_bead_ids = sorted(type_to_indices.keys())
     pair_list = list(itertools.combinations_with_replacement(unique_bead_ids, 2))
 
-    #get positions and boxes
+    # Get positions and boxes
     all_positions = []
     all_boxes = []
-    
+
+    # Iterate through trajectory, get positions / boxes
     for ts in u.trajectory:
         all_positions.append(u.atoms.positions.copy())
         all_boxes.append(ts.dimensions[:3].copy())
 
+    # Define positions and boxes
     positions_array = np.array(all_positions)
     boxes_array = np.array(all_boxes)
 
+    # RDF results and grid
     rdf_results = {}
     r_grid = None
-    
-    #make rdf list
+
+    # Get RDF for each pair
     for a, b in pair_list:
-        r, g = rdf_for_pair(
-            positions_array,
-            boxes_array,
-            type_to_indices[a],
-            type_to_indices[b],
-            r_max=20.0,
-            n_bins=200
-        )
+        r, g = rdf_for_pair(positions_array, boxes_array, type_to_indices[a], 
+                            type_to_indices[b], r_max=20.0, n_bins=200)
         if r_grid is None:
             r_grid = r
             rdf_results["r"] = r_grid
-            
+
         rdf_results[f"{a}-{b}"] = g
 
     return pd.DataFrame(rdf_results)
@@ -118,7 +160,7 @@ def export_rdfs_to_csv(target_rdfs, current_rdfs, project_name, output_filename=
     print(f"\nSaved final RDFs to {output_path}")
 
 
-################## Srel Utils ####################
+############# General Minimization Utils ################
 
 # Helper - mirror across box
 def minimum_image(delta, box_lengths):
@@ -144,6 +186,7 @@ def get_nonbonded_index_pairs(topology):
 def get_bond_index_pairs(topology):
     return np.asarray([(bond[0].index, bond[1].index) for bond in topology.bonds()], dtype=int)
 
+
 # Helper - bead type by index
 def get_bead_types_by_index(topology):
     bead_types = {}
@@ -167,211 +210,502 @@ def init_gradient_dict(parameter_set):
 
     return gradients
 
-# Nonbonded srel gradient accumulation
-def accumulate_nonbonded_srel(positions, boxes, topology, parameter_set, bead_types_by_index, frame_stride, cutoff_nm = None):
-    """
-    Accumulate ensemble averages of nonbonded derivatives for srel force
-    U = sqrt(gamma) * exp(-r^2 / (2*(a1^2 + a2^2)))
-    """
-    # Initialize gradient dict and sample count
-    acc = init_gradient_dict(parameter_set)
-    sample_count = 0
+# Helper - get indices for pair keys in the overall keys
+def pair_key_mask(pair_keys_all, pair_key):
+    pair_keys_all = np.ravel(pair_keys_all)
+    return np.array([pk == pair_key for pk in pair_keys_all], dtype=bool)
 
-    # Nonbonded index pairs
-    pair_indices = get_nonbonded_index_pairs(topology)
+# Helper - build the list of array / constant arguments based on param order
+def build_lambda_args(eval_param_names, values_dict):
+    """
+    Build ordered argument list for the lambdified derivative function
+    """
+    return [values_dict[name] for name in eval_param_names]
+
+
+################ Srel Specific Utils #################
+
+def compute_sampled_radii(positions, boxes, pair_indices, bead_types_by_index, frame_stride=1, cutoff_nm=None):
+    """
+    Compute sampled radii once for a set of index pairs across a trajectory
+
+    Parameters
+    ----------
+    positions : np.ndarray
+        Shape (n_frames, n_beads, 3), in nm
+    boxes : np.ndarray or None
+        Shape (n_frames, 3), in nm
+    pair_indices : np.ndarray
+        Shape (n_pairs, 2)
+    bead_types_by_index : dict
+        index -> bead_type string
+    frame_stride : int
+    cutoff_nm : float or None
+        If given, keep only radii < cutoff_nm
+
+    Returns
+    -------
+    samples : dict
+        {
+            "r": np.ndarray,
+            "pair_keys": np.ndarray(dtype=object),   # 1d array of tuple objects
+            "bead_type_i": np.ndarray(dtype=object), # 1d array of strings
+            "bead_type_j": np.ndarray(dtype=object), # 1d array of strings
+            "n_samples": int,
+        }
+    """
+    # Return empty dictionary if none of these pairs
     if len(pair_indices) == 0:
-        return acc
+        return {"r": np.empty(0, dtype=float), 
+                "pair_keys": np.empty(0, dtype=object),
+                "bead_type_i": np.empty(0, dtype=object),
+                "bead_type_j": np.empty(0, dtype=object),
+                "n_samples": 0}
 
+    # Otherwise, initialize pair indices 
+    pair_indices = np.asarray(pair_indices, dtype=int)
     ii = pair_indices[:, 0]
     jj = pair_indices[:, 1]
 
+    # Whether to use pbc, defined by boxes
     use_pbc = boxes is not None
 
-    # Precompute per pair bead type info once
-    pair_keys = []
-    bead_type_i = []
-    bead_type_j = []
-    gamma_arr = []
-    a1_arr = []
-    a2_arr = []
+    # Build the 1d object arrays
+    n_pairs = len(pair_indices)
+    pair_keys = np.empty(n_pairs, dtype=object)
+    bead_type_i = np.empty(n_pairs, dtype=object)
+    bead_type_j = np.empty(n_pairs, dtype=object)
 
-    # For all pairs, get gamma's and a's
-    for i, j in pair_indices:
+    # Fill these out from pair indices
+    for k, (i, j) in enumerate(pair_indices):
         bt_i = bead_types_by_index[i]
         bt_j = bead_types_by_index[j]
-        pair_key = canonical_pair(bt_i, bt_j)
+        pair_keys[k] = canonical_pair(bt_i, bt_j)
+        bead_type_i[k] = bt_i
+        bead_type_j[k] = bt_j
 
-        pair_keys.append(pair_key)
-        bead_type_i.append(bt_i)
-        bead_type_j.append(bt_j)
+    # Radii, keys, and bead types
+    all_r, all_pair_keys, all_bt_i, all_bt_j = [], [], [], []
 
-        gamma_arr.append(parameter_set.get_pair(pair_key, "gamma"))
-        a1_arr.append(parameter_set.get_individual(bt_i, "a"))
-        a2_arr.append(parameter_set.get_individual(bt_j, "a"))
-
-    gamma_arr = np.asarray(gamma_arr, dtype=float)
-    a1_arr = np.asarray(a1_arr, dtype=float)
-    a2_arr = np.asarray(a2_arr, dtype=float)
-
-    # Iterate through frames of trajectory
+    # Iterate through frames in positions (at stride)
     for frame_idx in range(0, positions.shape[0], frame_stride):
+        # Pull out the positions, get the difference
         pos = positions[frame_idx]
-
-        # Radius (accounting for pbcs)
         delta = pos[ii] - pos[jj]
+
+        # Calculate the new delta uses mirroring if pbc
         if use_pbc:
             box = boxes[frame_idx]
             delta = minimum_image(delta, box)
 
+        # Radii as norm of difference
         r = np.linalg.norm(delta, axis=1)
 
-        # Account for cutoff
+        # Account for cutoff by masking radii
         if cutoff_nm is not None:
             mask = r < cutoff_nm
             if not np.any(mask):
                 continue
-
-            # Mask for only radii and parameters above cutoff
-            r_use = r[mask]
-            gamma_use = gamma_arr[mask]
-            a1_use = a1_arr[mask]
-            a2_use = a2_arr[mask]
-
-            pair_keys_use = [pair_keys[k] for k in np.where(mask)[0]]
-            bead_type_i_use = [bead_type_i[k] for k in np.where(mask)[0]]
-            bead_type_j_use = [bead_type_j[k] for k in np.where(mask)[0]]
+            
+            # Set these as cutoff arbitrary values
+            frame_r = r[mask]
+            frame_pair_keys = pair_keys[mask]
+            frame_bt_i = bead_type_i[mask]
+            frame_bt_j = bead_type_j[mask]
         else:
-            # If no cutoff, use everything
-            r_use = r
-            gamma_use = gamma_arr
-            a1_use = a1_arr
-            a2_use = a2_arr
-            pair_keys_use = pair_keys
-            bead_type_i_use = bead_type_i
-            bead_type_j_use = bead_type_j
+            frame_r = r
+            frame_pair_keys = pair_keys
+            frame_bt_i = bead_type_i
+            frame_bt_j = bead_type_j
 
-        # Intermediate terms for calculation
-        D = a1_use * a1_use + a2_use * a2_use
-        exp_term = np.exp(-(r_use * r_use) / (2.0 * D))
-        sqrt_gamma = np.sqrt(gamma_use)
+        # Append these values over all frames
+        all_r.append(frame_r)
+        all_pair_keys.append(frame_pair_keys)
+        all_bt_i.append(frame_bt_i)
+        all_bt_j.append(frame_bt_j)
 
-        # dU/dgamma = (1/(2*sqrt(gamma))) * exp(...)
-        d_gamma = 0.5 / sqrt_gamma * exp_term
+    # Return empty again if no applicable radii
+    if len(all_r) == 0:
+        return {"r": np.empty(0, dtype=float),
+                "pair_keys": np.empty(0, dtype=object),
+                "bead_type_i": np.empty(0, dtype=object),
+                "bead_type_j": np.empty(0, dtype=object),
+                "n_samples": 0}
 
-        # dU/da1 = U * r^2 * a1 / D^2
-        # dU/da2 = U * r^2 * a2 / D^2
-        U = sqrt_gamma * exp_term
-        rr = r_use * r_use
-        D2 = D * D
+    # Otherwise, concatenate everything
+    r_all = np.concatenate(all_r)
+    pair_keys_all = np.concatenate(all_pair_keys)
+    bt_i_all = np.concatenate(all_bt_i)
+    bt_j_all = np.concatenate(all_bt_j)
 
-        # Change in a's
-        d_a1 = U * rr * a1_use / D2
-        d_a2 = U * rr * a2_use / D2
+    return {"r": r_all, "pair_keys": pair_keys_all, "bead_type_i": bt_i_all, 
+            "bead_type_j": bt_j_all, "n_samples": len(r_all)}
 
-        # Change in gammas (pairwise)
-        for k, pair_key in enumerate(pair_keys_use):
-            acc["pair"]["gamma"][pair_key] += d_gamma[k]
-            acc["individual"]["a"][bead_type_i_use[k]] += d_a1[k]
-            acc["individual"]["a"][bead_type_j_use[k]] += d_a2[k]
-
-        sample_count += len(r_use)
-
-    n = max(sample_count, 1)
-
-    # Take averages of accumulated change
-    for key in acc["pair"]["gamma"]:
-        acc["pair"]["gamma"][key] /= n
-
-    for key in acc["individual"]["a"]:
-        acc["individual"]["a"][key] /= n
-
-    return acc
-
-# Bonded srel gradient accumulation
-def accumulate_bonded_srel(positions, boxes, topology, parameter_set, bead_types_by_index, frame_stride):
+# Function to accumulate nonbonded gradients
+def accumulate_nonbonded_general(positions, boxes, topology, parameter_set, force_spec, bead_types_by_index,
+                                 frame_stride=1, cutoff_nm=None):
     """
-    Accumulate ensemble averages of bonded derivatives for srel force
-        U = (3*kBT/(2*b^2)) * r^2
-        dU/db = -(3*kBT/b^3) * r^2
+    Generalized nonbonded gradient accumulation using force_spec's nonbonded_first_derivatives
+
+    Returns
+    -------
+    first_grad : dict
+        Gradient dictionary, gradient for each parameter
     """
-    # Initialize gradient dict and bond pair indices
-    acc = init_gradient_dict(parameter_set)
+    # Initialize empty gradient / count dictionaries
+    first_grad = init_gradient_dict(parameter_set)
+    counts = init_gradient_dict(parameter_set)
+
+    # Get the pair indices and get the radii
+    pair_indices = get_nonbonded_index_pairs(topology)
+    samples = compute_sampled_radii(positions=positions, boxes=boxes, pair_indices=pair_indices, 
+                                    bead_types_by_index=bead_types_by_index, frame_stride=frame_stride,
+                                    cutoff_nm=cutoff_nm)
+
+    # Extract n samples, radii, and pair keys
+    r_all = samples["r"]
+    pair_keys_all = samples["pair_keys"]
+    n_samples = samples["n_samples"]
+
+    # If there are no samples, return gradient = 0 
+    if n_samples == 0:
+        return first_grad
+
+    # Pairwise nonbonded parameters
+    for pname in force_spec.nonbonded_pair_names:
+        deriv_func = force_spec.nonbonded_first_derivatives[pname]
+
+        # Iterate through pair keys
+        for pair_key in parameter_set.pair_parameters[pname].keys():
+            mask = pair_key_mask(pair_keys_all, pair_key)
+            if not np.any(mask):
+                continue
+            
+            # Mask the radii for that pair
+            bt_i, bt_j = pair_key
+            r = r_all[mask]
+
+            # Initialize the values with array of r
+            values = {"r": r}
+
+            # All pairwise params are scalar constants for this pair type
+            for qname in force_spec.nonbonded_pair_names:
+                # Add constant to values for that parameter
+                values[qname] = parameter_set.get_pair(pair_key, qname)
+
+            # Individual params also scalar constants for this pair type
+            for iname in force_spec.nonbonded_individual_names:
+                values[f"{iname}1"] = parameter_set.get_individual(bt_i, iname)
+                values[f"{iname}2"] = parameter_set.get_individual(bt_j, iname)
+
+            # Fixed params are scalar constants as well
+            for fname in force_spec.nonbonded_fixed_names:
+                val = parameter_set.get_fixed(fname)
+                try:
+                    values[fname] = float(val)
+                except Exception:
+                    values[fname] = val.value_in_unit(kilojoule_per_mole)
+
+            # Order the arguments correctly to pass into the lambda function
+            args = build_lambda_args(force_spec.nonbonded_eval_params, values)
+            contrib = deriv_func(*args)
+
+            # Add the sum of the contribution over all radii to the gradient
+            first_grad["pair"][pname][pair_key] += float(np.sum(contrib))
+            # Also add counts, for later averaging
+            counts["pair"][pname][pair_key] += len(r)
+
+    # Individual nonbonded parameters
+    for pname in force_spec.nonbonded_individual_names:
+        deriv_func_1 = force_spec.nonbonded_first_derivatives[f"{pname}1"]
+        deriv_func_2 = force_spec.nonbonded_first_derivatives[f"{pname}2"]
+
+        # Get unique pair keys
+        unique_pair_keys = set(pair_keys_all.tolist())
+
+        # Iterate through each pair, mask it
+        for pair_key in unique_pair_keys:
+            mask = pair_key_mask(pair_keys_all, pair_key)
+            if not np.any(mask):
+                continue
+
+            # Mask the radii for that pair key
+            bt_i, bt_j = pair_key
+            r = r_all[mask]
+
+            # Add radii array to values
+            values = {"r": r}
+
+            # Add pair parameters as constants again
+            for qname in force_spec.nonbonded_pair_names:
+                values[qname] = parameter_set.get_pair(pair_key, qname)
+
+            # Add individual parameters as constants
+            for iname in force_spec.nonbonded_individual_names:
+                values[f"{iname}1"] = parameter_set.get_individual(bt_i, iname)
+                values[f"{iname}2"] = parameter_set.get_individual(bt_j, iname)
+
+            # Add fixed parameters as constants
+            for fname in force_spec.nonbonded_fixed_names:
+                val = parameter_set.get_fixed(fname)
+                try:
+                    values[fname] = float(val)
+                except Exception:
+                    values[fname] = val.value_in_unit(kilojoule_per_mole)
+
+            # Build the argument list for the lambda function
+            args = build_lambda_args(force_spec.nonbonded_eval_params, values)
+
+            # For pairs - get contribution for both type1, type2
+            contrib_1 = deriv_func_1(*args)
+            contrib_2 = deriv_func_2(*args)
+
+            # Add sum of contribution to gradient and update counts
+            first_grad["individual"][pname][bt_i] += float(np.sum(contrib_1))
+            first_grad["individual"][pname][bt_j] += float(np.sum(contrib_2))
+            counts["individual"][pname][bt_i] += len(r)
+            counts["individual"][pname][bt_j] += len(r)
+
+    # Fixed nonbonded parameters
+    for pname in force_spec.nonbonded_fixed_names:
+        deriv_func = force_spec.nonbonded_first_derivatives[pname]
+
+        # Again, unique pair keys
+        unique_pair_keys = set(pair_keys_all.tolist())
+
+        # Mask out the radii for this unique pair
+        for pair_key in unique_pair_keys:
+            mask = pair_key_mask(pair_keys_all, pair_key)
+            if not np.any(mask):
+                continue
+
+            bt_i, bt_j = pair_key
+            r = r_all[mask]
+
+            # Set array of radii in values
+            values = {"r": r}
+
+            # Pair values as constants
+            for qname in force_spec.nonbonded_pair_names:
+                values[qname] = parameter_set.get_pair(pair_key, qname)
+
+            # Individual values as constants
+            for iname in force_spec.nonbonded_individual_names:
+                values[f"{iname}1"] = parameter_set.get_individual(bt_i, iname)
+                values[f"{iname}2"] = parameter_set.get_individual(bt_j, iname)
+
+            # Fixed values as constants
+            for fname in force_spec.nonbonded_fixed_names:
+                val = parameter_set.get_fixed(fname)
+                try:
+                    values[fname] = float(val)
+                except Exception:
+                    values[fname] = val.value_in_unit(kilojoule_per_mole)
+
+            # Construct ordered argument list for lambda function
+            args = build_lambda_args(force_spec.nonbonded_eval_params, values)
+            contrib = deriv_func(*args)
+
+            # Add the sum of the contribution to the gradient, update counts
+            first_grad["fixed"][pname] += float(np.sum(contrib))
+            counts["fixed"][pname] += len(r)
+
+    # We calculated the sum, but gradient values need to be averages
+    for pname in first_grad["pair"]:
+        for key in first_grad["pair"][pname]:
+            first_grad["pair"][pname][key] /= max(counts["pair"][pname][key], 1)
+
+    for pname in first_grad["individual"]:
+        for key in first_grad["individual"][pname]:
+            first_grad["individual"][pname][key] /= max(counts["individual"][pname][key], 1)
+
+    for pname in first_grad["fixed"]:
+        first_grad["fixed"][pname] /= max(counts["fixed"][pname], 1)
+
+    return first_grad
+
+# Function to accumulate bonded gradients
+def accumulate_bonded_general(positions, boxes, topology, parameter_set, force_spec, bead_types_by_index, 
+                              frame_stride=1):
+    """
+    Generalized bonded gradient accumulation using force_spec's bonded_first_derivatives
+
+    Returns
+    -------
+    first_grad : dict
+        Gradient dictionary, gradient for each parameter
+    """
+    # Initialize gradient and counts as zeros
+    first_grad = init_gradient_dict(parameter_set)
+    counts = init_gradient_dict(parameter_set)
+
+    # Get the bonded indices specifically, and get those radii
     bond_indices = get_bond_index_pairs(topology)
-    if len(bond_indices) == 0:
-        return acc
+    samples = compute_sampled_radii(positions=positions, boxes=boxes, pair_indices=bond_indices, 
+                                    bead_types_by_index=bead_types_by_index, frame_stride=frame_stride,
+                                    cutoff_nm=None)
 
-    # Indices for bonded pairs specifically
-    ii = bond_indices[:, 0]
-    jj = bond_indices[:, 1]
+    # Extract important quantities from samples
+    r_all = samples["r"]
+    pair_keys_all = samples["pair_keys"]
+    n_samples = samples["n_samples"]
 
-    use_pbc = boxes is not None
+    # If no bonds, return zero for gradient
+    if n_samples == 0:
+        return first_grad
 
-    pair_keys = []
-    b_arr = []
+    # Pairwise bonded parameters
+    for pname in force_spec.bonded_pair_names:
+        deriv_func = force_spec.bonded_first_derivatives[pname]
 
-    # Get the value of the boltzmann constant
-    kBT = parameter_set.get_fixed("kBT")
-    try:
-        kBT_val = kBT.value_in_unit(kilojoule_per_mole)
-    except Exception:
-        kBT_val = float(kBT)
+        # Get pair key and mask it out
+        for pair_key in parameter_set.pair_parameters[pname].keys():
+            mask = pair_key_mask(pair_keys_all, pair_key)
+            if not np.any(mask):
+                continue
 
-    # Compile values of b for each pair (bond)
-    for i, j in bond_indices:
-        bt_i = bead_types_by_index[i]
-        bt_j = bead_types_by_index[j]
-        pair_key = canonical_pair(bt_i, bt_j)
+            bt_i, bt_j = pair_key
+            r = r_all[mask]
 
-        pair_keys.append(pair_key)
-        b_arr.append(parameter_set.get_pair(pair_key, "b"))
+            values = {"r": r}
 
-    b_arr = np.asarray(b_arr, dtype=float)
+            # Add pair, individual, and fixed parameters as constants
+            for qname in force_spec.bonded_pair_names:
+                if parameter_set.has_pair(pair_key, qname):
+                    values[qname] = parameter_set.get_pair(pair_key, qname)
 
-    sample_count = 0
+            for iname in force_spec.bonded_individual_names:
+                values[f"{iname}1"] = parameter_set.get_individual(bt_i, iname)
+                values[f"{iname}2"] = parameter_set.get_individual(bt_j, iname)
 
-    # Iterate through frames of trajectory
-    for frame_idx in range(0, positions.shape[0], frame_stride):
-        pos = positions[frame_idx]
-        delta = pos[ii] - pos[jj]
+            for fname in force_spec.bonded_fixed_names:
+                val = parameter_set.get_fixed(fname)
+                try:
+                    values[fname] = float(val)
+                except Exception:
+                    values[fname] = val.value_in_unit(kilojoule_per_mole)
 
-        # Get radii for pairs, accounting for pbcs
-        if use_pbc:
-            box = boxes[frame_idx]
-            delta = minimum_image(delta, box)
+            # Create args list, calculate gradient
+            args = build_lambda_args(force_spec.bonded_eval_params, values)
+            contrib = deriv_func(*args)
 
-        r = np.linalg.norm(delta, axis=1)
+            first_grad["pair"][pname][pair_key] += float(np.sum(contrib))
+            counts["pair"][pname][pair_key] += len(r)
 
-        # dU/db = -(3*kBT/b^3) * r^2
-        d_b = -(3.0 * kBT_val / (b_arr ** 3)) * (r * r)
+    # Individual bonded parameters
+    for pname in force_spec.bonded_individual_names:
+        deriv_func_1 = force_spec.bonded_first_derivatives[f"{pname}1"]
+        deriv_func_2 = force_spec.bonded_first_derivatives[f"{pname}2"]
 
-        # Get the change in the b parameter for pairs
-        for k, pair_key in enumerate(pair_keys):
-            acc["pair"]["b"][pair_key] += d_b[k]
+        unique_pair_keys = set(pair_keys_all.tolist())
 
-        sample_count += len(r)
+        # Get pair key and mask it out
+        for pair_key in unique_pair_keys:
+            mask = pair_key_mask(pair_keys_all, pair_key)
+            if not np.any(mask):
+                continue
 
-    n = max(sample_count, 1)
+            bt_i, bt_j = pair_key
+            r = r_all[mask]
 
-    # Take the average
-    for key in acc["pair"]["b"]:
-        acc["pair"]["b"][key] /= n
+            values = {"r": r}
 
-    return acc
+            # Add pair, individual, and fixed parameters as constants
+            for qname in force_spec.bonded_pair_names:
+                if parameter_set.has_pair(pair_key, qname):
+                    values[qname] = parameter_set.get_pair(pair_key, qname)
 
-# Calculate gradient dictionary for srel
-def calculate_srel_gradients(aa_positions, cg_positions, topology, parameter_set, aa_boxes=None, 
+            for iname in force_spec.bonded_individual_names:
+                values[f"{iname}1"] = parameter_set.get_individual(bt_i, iname)
+                values[f"{iname}2"] = parameter_set.get_individual(bt_j, iname)
+
+            for fname in force_spec.bonded_fixed_names:
+                val = parameter_set.get_fixed(fname)
+                try:
+                    values[fname] = float(val)
+                except Exception:
+                    values[fname] = val.value_in_unit(kilojoule_per_mole)
+
+            # Create args list, calculate gradient
+            args = build_lambda_args(force_spec.bonded_eval_params, values)
+
+            contrib_1 = deriv_func_1(*args)
+            contrib_2 = deriv_func_2(*args)
+
+            first_grad["individual"][pname][bt_i] += float(np.sum(contrib_1))
+            first_grad["individual"][pname][bt_j] += float(np.sum(contrib_2))
+            counts["individual"][pname][bt_i] += len(r)
+            counts["individual"][pname][bt_j] += len(r)
+
+    # Fixed bonded parameters
+    for pname in force_spec.bonded_fixed_names:
+        deriv_func = force_spec.bonded_first_derivatives[pname]
+
+        unique_pair_keys = set(pair_keys_all.tolist())
+
+        # Get pair key and mask it out
+        for pair_key in unique_pair_keys:
+            mask = pair_key_mask(pair_keys_all, pair_key)
+            if not np.any(mask):
+                continue
+
+            bt_i, bt_j = pair_key
+            r = r_all[mask]
+
+            values = {"r": r}
+
+            # Add pair, individual, and fixed parameters as constants
+            for qname in force_spec.bonded_pair_names:
+                if parameter_set.has_pair(pair_key, qname):
+                    values[qname] = parameter_set.get_pair(pair_key, qname)
+
+            for iname in force_spec.bonded_individual_names:
+                values[f"{iname}1"] = parameter_set.get_individual(bt_i, iname)
+                values[f"{iname}2"] = parameter_set.get_individual(bt_j, iname)
+
+            for fname in force_spec.bonded_fixed_names:
+                val = parameter_set.get_fixed(fname)
+                try:
+                    values[fname] = float(val)
+                except Exception:
+                    values[fname] = val.value_in_unit(kilojoule_per_mole)
+
+            # Create args list, calculate gradient
+            args = build_lambda_args(force_spec.bonded_eval_params, values)
+            contrib = deriv_func(*args)
+
+            first_grad["fixed"][pname] += float(np.sum(contrib))
+            counts["fixed"][pname] += len(r)
+
+    # Compute the average for all gradients
+    for pname in first_grad["pair"]:
+        for key in first_grad["pair"][pname]:
+            first_grad["pair"][pname][key] /= max(counts["pair"][pname][key], 1)
+
+    for pname in first_grad["individual"]:
+        for key in first_grad["individual"][pname]:
+            first_grad["individual"][pname][key] /= max(counts["individual"][pname][key], 1)
+
+    for pname in first_grad["fixed"]:
+        first_grad["fixed"][pname] /= max(counts["fixed"][pname], 1)
+
+    return first_grad
+
+
+# Construct gradient dictionary for srel
+def calculate_srel_gradients(aa_positions, cg_positions, topology, parameter_set, force_spec, aa_boxes=None, 
                              cg_boxes=None, scale_by_beta=True, cutoff_nm=None, frame_stride=1):
     """
-    Fast REM-style gradient calculator specialized to the current SREL forcefield.
+    Generalized srel gradient calculation
 
     Parameters
     ----------
     aa/cg_positions : np.ndarray
         Shape (n_frames, n_beads, 3), mapped AA->CG or CG positions in nm
     topology : openmm topology object
-        CG topology
+        CG topology, applies to both AA and CG mapped positions
     parameter_set : ParameterSet
-        Parameters for the gradient
+        Current parameters for the gradient calculation
     aa/cg_boxes : np.ndarray or None
         Box lengths for each frame in nm
     scale_by_beta : bool
@@ -391,12 +725,12 @@ def calculate_srel_gradients(aa_positions, cg_positions, topology, parameter_set
     bead_types_by_index = get_bead_types_by_index(topology)
 
     # Accumulate nonbonded for AA and CG
-    aa_nb = accumulate_nonbonded_srel(aa_positions, aa_boxes, topology, parameter_set, bead_types_by_index, frame_stride, cutoff_nm)
-    cg_nb = accumulate_nonbonded_srel(cg_positions, cg_boxes, topology, parameter_set, bead_types_by_index, frame_stride, cutoff_nm)
+    aa_nb = accumulate_nonbonded_general(aa_positions, aa_boxes, topology, parameter_set, force_spec, bead_types_by_index, frame_stride, cutoff_nm)
+    cg_nb = accumulate_nonbonded_general(cg_positions, cg_boxes, topology, parameter_set, force_spec, bead_types_by_index, frame_stride, cutoff_nm)
 
     # Accumulate bonded for AA and CG
-    aa_bd = accumulate_bonded_srel(aa_positions, aa_boxes, topology, parameter_set, bead_types_by_index, frame_stride)
-    cg_bd = accumulate_bonded_srel(cg_positions, cg_boxes, topology, parameter_set, bead_types_by_index, frame_stride)
+    aa_bd = accumulate_bonded_general(aa_positions, aa_boxes, topology, parameter_set, force_spec, bead_types_by_index, frame_stride)
+    cg_bd = accumulate_bonded_general(cg_positions, cg_boxes, topology, parameter_set, force_spec, bead_types_by_index, frame_stride)
 
     # Initialize a gradient dictionary from parameters
     gradients = init_gradient_dict(parameter_set)
@@ -451,8 +785,7 @@ def calculate_srel_gradients(aa_positions, cg_positions, topology, parameter_set
 
 ############## Trajectory Loading Utils ##############
 
-def load_cg_trajectory_arrays(cg_topology_path, cg_trajectory_path, start=None, stop=None, 
-                              step=None):
+def load_cg_trajectory_arrays(cg_topology_path, cg_trajectory_path, start=None, stop=None, step=None):
     """
     Load an already coarse grained trajectory into arrays for gradient evaluation
 
@@ -484,8 +817,7 @@ def load_cg_trajectory_arrays(cg_topology_path, cg_trajectory_path, start=None, 
 
     return cg_positions_nm, cg_boxes_nm
 
-def map_aa_trajectory_to_cg_arrays(topology_path, trajectory_path, mapping_rules, start=None, 
-                                   stop=None, step=None):
+def map_aa_trajectory_to_cg_arrays(topology_path, trajectory_path, mapping_rules, start=None, stop=None, step=None):
     """
     Map an all atom trajectory into CG bead coordinates
 
@@ -520,7 +852,6 @@ def map_aa_trajectory_to_cg_arrays(topology_path, trajectory_path, mapping_rules
 
 
 ################ Csv Writing Utils ###################
-
 
 def write_parameter_set_to_csv(parameter_set, output_dir):
     """
@@ -605,7 +936,7 @@ def write_parameter_set_to_csv(parameter_set, output_dir):
             for pname in parameter_set.fixed_names:
                 val = parameter_set.fixed_parameters.get(pname, "")
 
-                # Handle OpenMM quantities nicely
+                # Handle the openmm quantities gracefully
                 try:
                     val = float(val)
                 except Exception:
@@ -625,4 +956,94 @@ def write_intermediate_parameters(parameter_set, project_name, iteration):
 def write_final_parameters(parameter_set, project_name):
     final_dir = os.path.join(project_name, "final_parameters")
     write_parameter_set_to_csv(parameter_set, final_dir)
+
+#################### Gradient Writing Utils ########################
+
+# Write out the gradient dictionary
+def write_gradient_dict_to_csv(gradients, output_dir):
+    """
+    Write gradient dictionary to 3 csv files:
+        - pair_gradients.csv
+        - individual_gradients.csv
+        - fixed_gradients.csv
+
+    Parameters
+    ----------
+    gradients : dict
+        Format:
+        {
+            "pair": {pname: {pair_key: grad}},
+            "individual": {pname: {bead_type: grad}},
+            "fixed": {pname: grad},
+        }
+    output_dir : str
+        Directory to write csv files into
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Pairwise gradients
+    pair_file = os.path.join(output_dir, "pair_gradients.csv")
+    pair_gradients = gradients.get("pair", {})
+
+    if pair_gradients:
+        all_pairs = set()
+        pair_names = sorted(pair_gradients.keys())
+
+        for pname in pair_names:
+            all_pairs.update(pair_gradients[pname].keys())
+
+        all_pairs = sorted(all_pairs)
+
+        with open(pair_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["bead_type_i", "bead_type_j"] + pair_names)
+
+            for pair in all_pairs:
+                row = [pair[0], pair[1]]
+                for pname in pair_names:
+                    row.append(pair_gradients.get(pname, {}).get(pair, ""))
+                writer.writerow(row)
+
+    # Individual gradients
+    indiv_file = os.path.join(output_dir, "individual_gradients.csv")
+    indiv_gradients = gradients.get("individual", {})
+
+    if indiv_gradients:
+        all_bead_types = set()
+        indiv_names = sorted(indiv_gradients.keys())
+
+        for pname in indiv_names:
+            all_bead_types.update(indiv_gradients[pname].keys())
+
+        all_bead_types = sorted(all_bead_types)
+
+        with open(indiv_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["bead_type"] + indiv_names)
+
+            for bead_type in all_bead_types:
+                row = [bead_type]
+                for pname in indiv_names:
+                    row.append(indiv_gradients.get(pname, {}).get(bead_type, ""))
+                writer.writerow(row)
+
+    # Fixed gradients
+    fixed_file = os.path.join(output_dir, "fixed_gradients.csv")
+    fixed_gradients = gradients.get("fixed", {})
+
+    if fixed_gradients:
+        with open(fixed_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["parameter", "value"])
+            for pname, value in sorted(fixed_gradients.items()):
+                writer.writerow([pname, value])
+
+# Helper - write gradients out for a given step
+def write_intermediate_gradients(gradients, project_name, iteration):
+    """
+    Write gradients for one iteration to:
+        project_name/cg_gradients/iteration_<iteration>/
+    """
+    output_dir = os.path.join(project_name, "cg_gradients", f"iteration_{iteration}")
+    write_gradient_dict_to_csv(gradients, output_dir)
 

@@ -3,14 +3,15 @@ import os
 import numpy as np
 import itertools
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
 from sys import stdout
+import sympy as sp
+import re
 from openmm.unit import *
 from openmm.app import Simulation, DCDReporter, StateDataReporter
 from openmm import CustomNonbondedForce, Discrete2DFunction, CustomBondForce
 from openmm import System, MonteCarloBarostat, LangevinIntegrator
 from aamd_utils import *
-
 
 ############### Parameter Handling Utils ##################
 
@@ -18,8 +19,12 @@ from aamd_utils import *
 PairKey = Tuple[str, str]
 
 # Defines the unique bead ID for an atom
-def bead_type_id(atom) -> str:
+def bead_instance_id(atom) -> str:
     return f"{atom.residue.name.strip()}_{atom.name.strip()}"
+
+# Defines the unique bead type ID for an atom
+def bead_type_id(atom) -> str:
+    return atom.residue.name.strip()
 
 # Enforces ordering of bead ID pairs for consistency
 def canonical_pair(a: str, b: str) -> PairKey:
@@ -45,12 +50,83 @@ def get_bonded_type_pairs(topology):
 
 # Get mapping of bead ID to bead mass from topology
 def extract_bead_mass_mapping(topology):
-    """TO DO: IMPLEMENT"""
+    """TO DO: IMPLEMENT - NOT CORRECT!!!"""
     bead_masses = dict()
     for atom in topology.atoms():
         unique_id = bead_type_id(atom)
         bead_masses[unique_id] = 54
     return bead_masses
+
+############# Forcefield Handling Utils ##############
+
+# Get parameter names from the config
+def extract_parameter_names(parameter_config, section, ptype):
+    if section not in parameter_config:
+        return []
+
+    return [pname for pname, spec in parameter_config[section].items() if spec["type"] == ptype]
+
+
+# Convert basic equation into openmm expectation for nonbonded 
+def insert_openmm_pair_lookups(expr, pairwise_names):
+    """
+    Convert symbolic nonbonded expression like:
+        gamma*exp(...)
+    into openmm ready expression:
+        gamma(type1,type2)*exp(...)
+    specifically adding type reference to all pairwise parameters
+    """
+    out = expr
+    for pname in pairwise_names:
+        out = re.sub(rf"\b{re.escape(pname)}\b", f"{pname}(type1,type2)", out)
+    return out
+
+# Create dictionary of local symbols for sympy
+def build_sympy_locals(var_names):
+    """
+    Build locals dictionary for sympify
+    Overwrites any potential built-in functions with these variable names
+    """
+    return {name: sp.Symbol(name) for name in var_names}
+
+# Build the first and second derivative strings with sympy
+def build_derivative_functions(expr_string, eval_param_names, differentiate_names):
+    """
+    Build first and second derivative dictionaries from an expression string
+
+    Returns
+    -------
+    first_exprs, first_funcs (first derivative string and lambda function)
+    second_exprs, second_funcs (second derivative string and lambda function)
+    """
+    # Construct the custom local symbols from parameter names
+    custom_locals = build_sympy_locals(eval_param_names)
+    # Parse the equation string into a sympy expression
+    parsed_expr = sp.sympify(expr_string, locals=custom_locals)
+
+    # Make a list of sympy symbols to differentiate wrt
+    eval_symbols = tuple(custom_locals[name] for name in eval_param_names)
+
+    # Initialize expressions and functions
+    first_exprs, first_funcs, second_exprs, second_funcs = {}, {}, {}, {}
+
+    # Iterate through parameters for PDEs
+    for pname in differentiate_names:
+        sym = custom_locals[pname]
+
+        # Get the first derivative as string
+        first_deriv = sp.diff(parsed_expr, sym)
+        first_exprs[pname] = first_deriv
+        # Convert first derivative to sympy lambda function (with numpy! important so its fast)
+        first_funcs[pname] = sp.lambdify(eval_symbols, first_deriv, modules="numpy")
+
+        # Get the second derivative as string
+        second_deriv = sp.diff(first_deriv, sym)
+        second_exprs[pname] = second_deriv
+        # Convert second derivative to sympy lambda function
+        second_funcs[pname] = sp.lambdify(eval_symbols, second_deriv, modules="numpy")
+
+    return first_exprs, first_funcs, second_exprs, second_funcs
 
 
 ################# Parameter Object ##################
@@ -69,6 +145,11 @@ class ParameterSet:
 
     # Fixed parameters - dictionary of parameter name : default value
     fixed_parameters: Dict[str, object] = field(default_factory=dict)
+
+    # Flags - whether to update each parameter according to config
+    pair_update_flags: Dict[str, bool] = field(default_factory=dict)
+    individual_update_flags: Dict[str, bool] = field(default_factory=dict)
+    fixed_update_flags: Dict[str, bool] = field(default_factory=dict)
 
     ########### Functions for ease of class use ############
     def get_pair(self, pair: PairKey, name: str) -> float:
@@ -103,25 +184,35 @@ class ParameterSet:
         gradients : dict
             Dictionary of parameter type : {name : gradient value}
         learning_rate : float
-            For basic gradient descent, update as theta_new = theta - lr * grad
+            For standard gradient descent, how much to move along the gradient
         """
 
         # Pairwise parameters
         for pname, param_dict in gradients["pair"].items():
             for key, grad in param_dict.items():
+                # Check whether to update this parameter
+                if not self.pair_update_flags.get(pname, True):
+                    continue
+                # Update the value, enforcing > 0
                 value = self.pair_parameters[pname][key] - learning_rate * grad
                 self.pair_parameters[pname][key] = max(value, 1e-6)
 
         # Individual parameters
         for pname, param_dict in gradients["individual"].items():
             for key, grad in param_dict.items():
+                # Check whether to update this parameter
+                if not self.individual_update_flags.get(pname, True):
+                    continue
+                # Update the value, enforcing > 0
                 value = self.individual_parameters[pname][key] - learning_rate * grad
                 self.individual_parameters[pname][key] = max(value, 1e-6)
 
         # Fixed parameters
         for pname, grad in gradients["fixed"].items():
-            continue
-            # Placeholder until we figure out how to add a true constant to the ff, don't update kbt
+            # Check whether to update this parameter
+            if not self.fixed_update_flags.get(pname, True):
+                continue
+            # Update the value, enforcing > 0
             value = self.fixed_parameters[pname] - learning_rate * grad
             self.fixed_parameters[pname] = max(value, 1e-6)
 
@@ -129,10 +220,13 @@ class ParameterSet:
 
 @dataclass
 class ForceSpec:
-    ######### Attributes ##############
+
+    # Define the expressions themselves
     nonbonded_expression: Optional[str] = None
+    nonbonded_expression_openmm: Optional[str] = None
     bonded_expression: Optional[str] = None
 
+    # Define the names of the parameters from expressions
     nonbonded_pair_names: List[str] = field(default_factory=list)
     nonbonded_individual_names: List[str] = field(default_factory=list)
     nonbonded_fixed_names: List[str] = field(default_factory=list)
@@ -141,13 +235,32 @@ class ForceSpec:
     bonded_individual_names: List[str] = field(default_factory=list)
     bonded_fixed_names: List[str] = field(default_factory=list)
 
+    # Ordered variable lists used for lambdify, needed to evaluate
+    nonbonded_eval_params: List[str] = field(default_factory=list)
+    bonded_eval_params: List[str] = field(default_factory=list)
+
+    # First derivative callable lambda functions
+    nonbonded_first_derivatives: Dict[str, Callable] = field(default_factory=dict)
+    bonded_first_derivatives: Dict[str, Callable] = field(default_factory=dict)
+
+    # Second derivative callable lambda functions (same parameters as first derivatives)
+    nonbonded_second_derivatives: Dict[str, Callable] = field(default_factory=dict)
+    bonded_second_derivatives: Dict[str, Callable] = field(default_factory=dict)
+
+    # Save symbolic expressions for debugging / transparency
+    nonbonded_first_derivative_exprs: Dict[str, sp.Expr] = field(default_factory=dict)
+    bonded_first_derivative_exprs: Dict[str, sp.Expr] = field(default_factory=dict)
+
+    nonbonded_second_derivative_exprs: Dict[str, sp.Expr] = field(default_factory=dict)
+    bonded_second_derivative_exprs: Dict[str, sp.Expr] = field(default_factory=dict)
+
 
 ############# Config Parsing Utils #################
 
 # Parse parameter from the config file
 def parse_parameters_from_config(parameter_config, topology, temperature):
     """
-    Load parameters from config file into Parameter object
+    Load parameters from config file into a Parameter object
     Parameter Categories:
     - Nonbonded
         - Pairwise
@@ -159,15 +272,20 @@ def parse_parameters_from_config(parameter_config, topology, temperature):
         - Fixed
     """
 
-    # Initialize objects to fill
+    # Initialize objects to fill from config
     pair_names = []
     individual_names = []
     fixed_names = []
+
+    pair_update_flags = {}
+    individual_update_flags = {}
+    fixed_update_flags = {}
 
     pair_parameters = {}
     individual_parameters = {}
     fixed_parameters = {}
 
+    # Get useful mappings from topology
     all_bead_types = get_unique_bead_types(topology)
     all_type_pairs = get_all_type_pairs(topology)
     bonded_type_pairs = get_bonded_type_pairs(topology)
@@ -177,18 +295,27 @@ def parse_parameters_from_config(parameter_config, topology, temperature):
         for pname, spec in parameter_config["nonbonded"].items():
             ptype = spec["type"]
             default = spec["default"]
+            update_flag = spec.get("update", True)
 
             if ptype == "pairwise":
                 pair_names.append(pname)
                 pair_parameters[pname] = {pair: float(default) for pair in all_type_pairs}
+                pair_update_flags[pname] = update_flag
 
             elif ptype == "individual":
                 individual_names.append(pname)
                 individual_parameters[pname] = {bead_type: float(default) for bead_type in all_bead_types}
+                individual_update_flags[pname] = update_flag
 
             elif ptype == "fixed":
                 fixed_names.append(pname)
-                fixed_parameters[pname] = default
+                # Accounts for potential inclusion of Boltzmann constant as fixed param
+                if pname == "kBT":
+                    kBT = MOLAR_GAS_CONSTANT_R * temperature * kelvin
+                    fixed_parameters[pname] = kBT
+                else:
+                    fixed_parameters[pname] = default
+                fixed_update_flags[pname] = update_flag
 
             else:
                 raise ValueError(f"Unknown parameter type '{ptype}' for '{pname}'")
@@ -198,51 +325,177 @@ def parse_parameters_from_config(parameter_config, topology, temperature):
         for pname, spec in parameter_config["bonded"].items():
             ptype = spec["type"]
             default = spec["default"]
+            update_flag = spec.get("update", True)
 
             if ptype == "pairwise":
                 if pname not in pair_names:
                     pair_names.append(pname)
                 pair_parameters[pname] = {pair: float(default) for pair in bonded_type_pairs}
+                pair_update_flags[pname] = update_flag
 
             elif ptype == "individual":
                 if pname not in individual_names:
                     individual_names.append(pname)
                 individual_parameters[pname] = {bead_type: float(default) for bead_type in all_bead_types}
+                individual_update_flags[pname] = update_flag
 
             elif ptype == "fixed":
                 if pname not in fixed_names:
                     fixed_names.append(pname)
-                fixed_parameters[pname] = default
+                # Accounts for potential inclusion of Boltzmann constant as fixed param
+                if pname == "kBT":
+                    kBT = MOLAR_GAS_CONSTANT_R * temperature * kelvin
+                    fixed_parameters[pname] = kBT
+                else:
+                    fixed_parameters[pname] = default
+                fixed_update_flags[pname] = update_flag
+
 
             else:
                 raise ValueError(f"Unknown parameter type '{ptype}' for '{pname}'")
             
-    # Add boltzmann constant as a fixed parameter
-    kBT = MOLAR_GAS_CONSTANT_R * temperature * kelvin
-    if "kBT" not in fixed_names:
-        fixed_names.append("kBT")
-    fixed_parameters["kBT"] = kBT
 
+    # Define parameter set object from all of the extracted quantities
     ps = ParameterSet(pair_names=pair_names, individual_names=individual_names, 
                       fixed_names=fixed_names, pair_parameters=pair_parameters,
-                      individual_parameters=individual_parameters, fixed_parameters=fixed_parameters)
+                      individual_parameters=individual_parameters, fixed_parameters=fixed_parameters,
+                      pair_update_flags=pair_update_flags, individual_update_flags=individual_update_flags,
+                      fixed_update_flags=fixed_update_flags)
     return ps
 
 # Parse forcefield parameters from config
-def parse_forcefield_from_config(general_config):
-    """TO DO: GENERALIZE"""
-    ff = None
-    if general_config["cg forcefield"] == "srel":
-        ff = ForceSpec(nonbonded_expression="sqrt(gamma(type1,type2))*exp(-r^2/(2*(a1*a1 + a2*a2)))",
-                       bonded_expression="(3/(2*b*b))*r^2",
-                       
-                       nonbonded_pair_names=["gamma"],
-                       nonbonded_individual_names=["a"],
-                       nonbonded_fixed_names=[],
-                       
-                       bonded_pair_names=["b"],
-                       bonded_individual_names=[],
-                       bonded_fixed_names=["kBT"])
+def parse_forcefield_from_config(general_config, parameter_config):
+    """
+    Parse parameters corresponding to the forcefield config
+
+    Parameters
+    ----------
+    general_config : dict
+        Needs to contain:
+            - "nonbonded expression"
+            - "bonded expression"
+    parameter_config : dict
+        Defines characteristics of the parameters contained within the expressions
+
+    Returns
+    -------
+    ForceSpec
+    """
+    # Extract the bonded and nonbonded expressions
+    nonbonded_expression = general_config.get("nonbonded expression", None)
+    bonded_expression = general_config.get("bonded expression", None)
+
+    # Get parameter names for each category
+    nonbonded_pair_names = extract_parameter_names(parameter_config, "nonbonded", "pairwise")
+    nonbonded_individual_names = extract_parameter_names(parameter_config, "nonbonded", "individual")
+    nonbonded_fixed_names = extract_parameter_names(parameter_config, "nonbonded", "fixed")
+
+    bonded_pair_names = extract_parameter_names(parameter_config, "bonded", "pairwise")
+    bonded_individual_names = extract_parameter_names(parameter_config, "bonded", "individual")
+    bonded_fixed_names = extract_parameter_names(parameter_config, "bonded", "fixed")
+
+    # Automatically includes kBT as bonded/nonbonded fixed if the expression uses it
+    # (if user didn't add kBT in the parameters)
+    if bonded_expression is not None and re.search(r"\bkBT\b", bonded_expression):
+        if "kBT" not in bonded_fixed_names:
+            bonded_fixed_names.append("kBT")
+
+    if nonbonded_expression is not None and re.search(r"\bkBT\b", nonbonded_expression):
+        if "kBT" not in nonbonded_fixed_names:
+            nonbonded_fixed_names.append("kBT")
+
+    # Create the openmm versions of the nonbonded expression (with types)
+    nonbonded_expression_openmm = None
+    if nonbonded_expression is not None:
+        nonbonded_expression_openmm = insert_openmm_pair_lookups(nonbonded_expression, nonbonded_pair_names)
+
+    ###### Symbolic Differentiation ######
+
+    # Nonbonded expression variables - start with radii, update for angles and torsion
+    nonbonded_eval_params = ["r"]
+
+    # Add the pairwise parameters in symbolic form
+    nonbonded_eval_params.extend(nonbonded_pair_names)
+
+    # Add individual parameters as pname1, pname2 (required for openmm individual)
+    nonbonded_diff_names = list(nonbonded_pair_names)
+    for pname in nonbonded_individual_names:
+        nonbonded_eval_params.extend([f"{pname}1", f"{pname}2"])
+        nonbonded_diff_names.extend([f"{pname}1", f"{pname}2"])
+
+    # Add fixed names
+    nonbonded_eval_params.extend(nonbonded_fixed_names)
+    nonbonded_diff_names.extend(nonbonded_fixed_names)
+
+    # Housekeeping, removes any duplicates
+    nonbonded_eval_params = list(dict.fromkeys(nonbonded_eval_params))
+    nonbonded_diff_names = list(dict.fromkeys(nonbonded_diff_names))
+
+    # Bonded expression variables - again only for radii so far
+    bonded_eval_params = ["r"]
+    bonded_eval_params.extend(bonded_pair_names)
+
+    # Individual parameters (pname1, pname2)
+    bonded_diff_names = list(bonded_pair_names)
+    for pname in bonded_individual_names:
+        bonded_eval_params.extend([f"{pname}1", f"{pname}2"])
+        bonded_diff_names.extend([f"{pname}1", f"{pname}2"])
+
+    # Add fixed parameters
+    bonded_eval_params.extend(bonded_fixed_names)
+    bonded_diff_names.extend(bonded_fixed_names)
+
+    # Housekeeping
+    bonded_eval_params = list(dict.fromkeys(bonded_eval_params))
+    bonded_diff_names = list(dict.fromkeys(bonded_diff_names))
+
+    # Build the derivative dictionaries (nonbonded)
+    nb_first_exprs, nb_first_funcs, nb_second_exprs, nb_second_funcs = {}, {}, {}, {}
+
+    if nonbonded_expression is not None:
+        (nb_first_exprs, nb_first_funcs, nb_second_exprs, nb_second_funcs) = \
+        build_derivative_functions(nonbonded_expression, nonbonded_eval_params, 
+                                   nonbonded_diff_names)
+
+    # Build the derivative dictionaries (bonded)
+    bd_first_exprs, bd_first_funcs, bd_second_exprs, bd_second_funcs = {}, {}, {}, {}
+
+    if bonded_expression is not None:
+        (bd_first_exprs, bd_first_funcs, bd_second_exprs, bd_second_funcs) = \
+            build_derivative_functions(bonded_expression, bonded_eval_params, 
+                                       bonded_diff_names)
+
+    # Build the actual force object
+    ff = ForceSpec(
+
+        nonbonded_expression=nonbonded_expression,
+        nonbonded_expression_openmm=nonbonded_expression_openmm,
+        bonded_expression=bonded_expression,
+
+        nonbonded_pair_names=nonbonded_pair_names,
+        nonbonded_individual_names=nonbonded_individual_names,
+        nonbonded_fixed_names=nonbonded_fixed_names,
+
+        bonded_pair_names=bonded_pair_names,
+        bonded_individual_names=bonded_individual_names,
+        bonded_fixed_names=bonded_fixed_names,
+
+        nonbonded_eval_params=nonbonded_eval_params,
+        bonded_eval_params=bonded_eval_params,
+
+        nonbonded_first_derivatives=nb_first_funcs,
+        bonded_first_derivatives=bd_first_funcs,
+
+        nonbonded_second_derivatives=nb_second_funcs,
+        bonded_second_derivatives=bd_second_funcs,
+
+        nonbonded_first_derivative_exprs=nb_first_exprs,
+        bonded_first_derivative_exprs=bd_first_exprs,
+
+        nonbonded_second_derivative_exprs=nb_second_exprs,
+        bonded_second_derivative_exprs=bd_second_exprs,
+    )
+
     return ff
 
 ############### ForceField Utils ################
@@ -260,7 +513,7 @@ def build_nonbonded_force(topology, parameter_set: ParameterSet, force_spec: For
     n_types = len(bead_types)
 
     # Define a custom nonbonded force with the expression
-    force = CustomNonbondedForce(force_spec.nonbonded_expression)
+    force = CustomNonbondedForce(force_spec.nonbonded_expression_openmm)
 
     # Add type as per-particle parameter, so type is indexed by i, j
     force.addPerParticleParameter("type")
