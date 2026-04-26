@@ -510,17 +510,21 @@ def accumulate_nonbonded_general(positions, boxes, topology, parameter_set, forc
             first_grad["fixed"][pname] += float(np.sum(contrib))
             counts["fixed"][pname] += len(r)
 
+    # Compute number of frames used
+    n_frames_used = len(range(0, positions.shape[0], frame_stride))
+    n_frames_used = max(n_frames_used, 1)
+
     # We calculated the sum, but gradient values need to be averages
     for pname in first_grad["pair"]:
         for key in first_grad["pair"][pname]:
-            first_grad["pair"][pname][key] /= max(counts["pair"][pname][key], 1)
+            first_grad["pair"][pname][key] /= n_frames_used
 
     for pname in first_grad["individual"]:
         for key in first_grad["individual"][pname]:
-            first_grad["individual"][pname][key] /= max(counts["individual"][pname][key], 1)
+            first_grad["individual"][pname][key] /= n_frames_used
 
     for pname in first_grad["fixed"]:
-        first_grad["fixed"][pname] /= max(counts["fixed"][pname], 1)
+        first_grad["fixed"][pname] /= n_frames_used
 
     return first_grad
 
@@ -677,17 +681,21 @@ def accumulate_bonded_general(positions, boxes, topology, parameter_set, force_s
             first_grad["fixed"][pname] += float(np.sum(contrib))
             counts["fixed"][pname] += len(r)
 
+    # Compute number of frames used
+    n_frames_used = len(range(0, positions.shape[0], frame_stride))
+    n_frames_used = max(n_frames_used, 1)
+    
     # Compute the average for all gradients
     for pname in first_grad["pair"]:
         for key in first_grad["pair"][pname]:
-            first_grad["pair"][pname][key] /= max(counts["pair"][pname][key], 1)
+            first_grad["pair"][pname][key] /= n_frames_used
 
     for pname in first_grad["individual"]:
         for key in first_grad["individual"][pname]:
-            first_grad["individual"][pname][key] /= max(counts["individual"][pname][key], 1)
+            first_grad["individual"][pname][key] /= n_frames_used
 
     for pname in first_grad["fixed"]:
-        first_grad["fixed"][pname] /= max(counts["fixed"][pname], 1)
+        first_grad["fixed"][pname] /= n_frames_used
 
     return first_grad
 

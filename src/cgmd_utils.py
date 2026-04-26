@@ -54,7 +54,7 @@ def extract_bead_mass_mapping(topology):
     bead_masses = dict()
     for atom in topology.atoms():
         unique_id = bead_type_id(atom)
-        bead_masses[unique_id] = 54
+        bead_masses[unique_id] = 18
     return bead_masses
 
 ############# Forcefield Handling Utils ##############

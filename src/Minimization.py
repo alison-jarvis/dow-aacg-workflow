@@ -121,9 +121,9 @@ class CG_AA_Minimizer():
                                                  force_spec=self.cg_sim.forcefield_form,
                                                  aa_boxes=self.aa_boxes,
                                                  cg_boxes=self.cg_boxes,
-                                                 scale_by_beta=False,
+                                                 scale_by_beta=True,
                                                  cutoff_nm=self.general_config["cg interaction cutoff"],
-                                                 frame_stride=1)
+                                                 frame_stride=10)
             
             # Write these gradients to a csv
             write_intermediate_gradients(gradients, self.project_name, i)

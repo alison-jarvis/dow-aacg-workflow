@@ -13,6 +13,7 @@ from openmm.unit import picosecond, femtoseconds, bar
 from openmm import LangevinIntegrator
 from openmm.app import Simulation, PDBReporter, DCDReporter, StateDataReporter
 from openmm import MonteCarloBarostat
+from openmm import NonbondedForce, CustomNonbondedForce
 from sys import stdout
 import pandas as pd
 import os
@@ -431,6 +432,19 @@ def create_universal_system(topology, molecules, general_config):
 
         # Create the system from the forcefield and topology object
         system = off_ff.create_openmm_system(topology)
+
+        ##### New ######
+
+        for force in system.getForces():
+            if isinstance(force, NonbondedForce):
+                force.setNonbondedMethod(NonbondedForce.PME)
+                force.setCutoffDistance(cutoff)
+                force.setUseDispersionCorrection(True)
+            elif isinstance(force, CustomNonbondedForce):
+                force.setNonbondedMethod(CustomNonbondedForce.CutoffPeriodic)
+                force.setCutoffDistance(cutoff)
+
+        ##### End New #####
 
         return system
 
