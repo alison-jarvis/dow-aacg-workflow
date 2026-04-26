@@ -49,7 +49,7 @@ def extract_bead_mass_mapping(topology):
     bead_masses = dict()
     for atom in topology.atoms():
         unique_id = bead_type_id(atom)
-        bead_masses[unique_id] = 54
+        bead_masses[unique_id] = 18.01528 # Placeholder for water, will need to update for other bead types
     return bead_masses
 
 
@@ -109,6 +109,9 @@ class ParameterSet:
         # Pairwise parameters
         for pname, param_dict in gradients["pair"].items():
             for key, grad in param_dict.items():
+                #clip grad
+                grad = np.clip(grad, -25.0, 25.0)
+
                 value = self.pair_parameters[pname][key] - learning_rate * grad
 
                 # gamma may be negative
@@ -121,6 +124,9 @@ class ParameterSet:
         # Individual parameters
         for pname, param_dict in gradients["individual"].items():
             for key, grad in param_dict.items():
+                #clip grad
+                grad = np.clip(grad, -25.0, 25.0)
+
                 value = self.individual_parameters[pname][key] - learning_rate * grad
 
                 # keep widths positive
@@ -244,12 +250,12 @@ def parse_forcefield_from_config(general_config):
     ff = None
     if general_config["cg forcefield"] == "srel":
         ff = ForceSpec(
-            nonbonded_expression="gamma(type1,type2)*exp(-r^2/(2*(a1*a1 + a2*a2)))",
+            nonbonded_expression="kBT*gamma(type1,type2)*exp(-r^2/(2*(a1*a1 + a2*a2)))",
             bonded_expression="kBT*(3/(2*b*b))*r^2",
 
             nonbonded_pair_names=["gamma"],
             nonbonded_individual_names=["a"],
-            nonbonded_fixed_names=[],
+            nonbonded_fixed_names=["kBT"],
 
             bonded_pair_names=["b"],
             bonded_individual_names=[],

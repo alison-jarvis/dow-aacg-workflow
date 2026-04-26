@@ -169,26 +169,33 @@ def init_gradient_dict(parameter_set):
     return gradients
 
 # Nonbonded srel gradient accumulation
-def accumulate_nonbonded_srel(positions, boxes, topology, parameter_set, bead_types_by_index, frame_stride, cutoff_nm = None):
+def accumulate_nonbonded_srel(
+    positions, boxes, topology, parameter_set,
+    bead_types_by_index, frame_stride, cutoff_nm=None):
     """
-    Accumulate ensemble averages of nonbonded derivatives for srel force
-    U = gamma * exp(-r^2 / (2*(a1^2 + a2^2)))
-    """
-    # Initialize gradient dict and sample count
-    acc = init_gradient_dict(parameter_set)
-    sample_count = 0
+    Accumulate ensemble averages of nonbonded derivatives for Srel.
 
-    # Nonbonded index pairs
+    U = kBT * gamma * exp(-r^2 / (2*(a1^2 + a2^2)))
+
+    Returns <dU/dlambda> averaged over frames.
+    """
+    kBT = parameter_set.get_fixed("kBT")
+    try:
+        kBT_val = kBT.value_in_unit(kilojoule_per_mole)
+    except Exception:
+        kBT_val = float(kBT)
+
+    acc = init_gradient_dict(parameter_set)
+    frame_count = 0
+
     pair_indices = get_nonbonded_index_pairs(topology)
     if len(pair_indices) == 0:
         return acc
 
     ii = pair_indices[:, 0]
     jj = pair_indices[:, 1]
-
     use_pbc = boxes is not None
 
-    # Precompute per pair bead type info once
     pair_keys = []
     bead_type_i = []
     bead_type_j = []
@@ -196,7 +203,6 @@ def accumulate_nonbonded_srel(positions, boxes, topology, parameter_set, bead_ty
     a1_arr = []
     a2_arr = []
 
-    # For all pairs, get gamma's and a's
     for i, j in pair_indices:
         bt_i = bead_types_by_index[i]
         bt_j = bead_types_by_index[j]
@@ -214,71 +220,67 @@ def accumulate_nonbonded_srel(positions, boxes, topology, parameter_set, bead_ty
     a1_arr = np.asarray(a1_arr, dtype=float)
     a2_arr = np.asarray(a2_arr, dtype=float)
 
-    # Iterate through frames of trajectory
     for frame_idx in range(0, positions.shape[0], frame_stride):
         pos = positions[frame_idx]
 
-        # Radius (accounting for pbcs)
         delta = pos[ii] - pos[jj]
         if use_pbc:
-            box = boxes[frame_idx]
-            delta = minimum_image(delta, box)
+            delta = minimum_image(delta, boxes[frame_idx])
 
         r = np.linalg.norm(delta, axis=1)
 
-        # Account for cutoff
         if cutoff_nm is not None:
             mask = r < cutoff_nm
             if not np.any(mask):
                 continue
 
-            # Mask for only radii and parameters above cutoff
+            indices = np.where(mask)[0]
             r_use = r[mask]
             gamma_use = gamma_arr[mask]
             a1_use = a1_arr[mask]
             a2_use = a2_arr[mask]
-
-            pair_keys_use = [pair_keys[k] for k in np.where(mask)[0]]
-            bead_type_i_use = [bead_type_i[k] for k in np.where(mask)[0]]
-            bead_type_j_use = [bead_type_j[k] for k in np.where(mask)[0]]
         else:
-            # If no cutoff, use everything
+            indices = np.arange(len(r))
             r_use = r
             gamma_use = gamma_arr
             a1_use = a1_arr
             a2_use = a2_arr
-            pair_keys_use = pair_keys
-            bead_type_i_use = bead_type_i
-            bead_type_j_use = bead_type_j
 
-        # Intermediate terms for calculation
         D = a1_use * a1_use + a2_use * a2_use
         exp_term = np.exp(-(r_use * r_use) / (2.0 * D))
 
-        # U = gamma * exp(...)
-        U = gamma_use * exp_term
+        U = kBT_val * gamma_use * exp_term
 
-        # dU/dgamma = exp(...)
-        d_gamma = exp_term
+        d_gamma = kBT_val * exp_term
 
         rr = r_use * r_use
         D2 = D * D
 
-        # Change in a's
         d_a1 = U * rr * a1_use / D2
         d_a2 = U * rr * a2_use / D2
 
-        # Change in gammas (pairwise)
-        for k, pair_key in enumerate(pair_keys_use):
-            acc["pair"]["gamma"][pair_key] += d_gamma[k]
-            acc["individual"]["a"][bead_type_i_use[k]] += d_a1[k]
-            acc["individual"]["a"][bead_type_j_use[k]] += d_a2[k]
+        frame_pair_gamma = {}
+        frame_indiv_a = {}
 
-        sample_count += len(r_use)
+        for local_k, global_k in enumerate(indices):
+            pair_key = pair_keys[global_k]
+            bt_i = bead_type_i[global_k]
+            bt_j = bead_type_j[global_k]
 
-    n = max(sample_count, 1)
+            frame_pair_gamma[pair_key] = frame_pair_gamma.get(pair_key, 0.0) + d_gamma[local_k]
+            frame_indiv_a[bt_i] = frame_indiv_a.get(bt_i, 0.0) + d_a1[local_k]
+            frame_indiv_a[bt_j] = frame_indiv_a.get(bt_j, 0.0) + d_a2[local_k]
 
-    # Take averages of accumulated change
+        for key, val in frame_pair_gamma.items():
+            acc["pair"]["gamma"][key] += val
+
+        for key, val in frame_indiv_a.items():
+            acc["individual"]["a"][key] += val
+
+        frame_count += 1
+
+    n = max(frame_count, 1)
+
     for key in acc["pair"]["gamma"]:
         acc["pair"]["gamma"][key] /= n
 
@@ -327,7 +329,7 @@ def accumulate_bonded_srel(positions, boxes, topology, parameter_set, bead_types
 
     b_arr = np.asarray(b_arr, dtype=float)
 
-    sample_count = 0
+    frame_count = 0
 
     # Iterate through frames of trajectory
     for frame_idx in range(0, positions.shape[0], frame_stride):
@@ -348,9 +350,9 @@ def accumulate_bonded_srel(positions, boxes, topology, parameter_set, bead_types
         for k, pair_key in enumerate(pair_keys):
             acc["pair"]["b"][pair_key] += d_b[k]
 
-        sample_count += len(r)
+        frame_count += 1
 
-    n = max(sample_count, 1)
+    n = max(frame_count, 1)
 
     # Take the average
     for key in acc["pair"]["b"]:
@@ -534,12 +536,213 @@ def flatten_gradient_dict(gradients):
 
     return np.array(vals, dtype=float)
 
-
 def calculate_srel_gradient_norm(gradients):
     g = flatten_gradient_dict(gradients)
     if g.size == 0:
         return 0.0
     return float(np.linalg.norm(g))
+
+def compute_cg_frame_energies(
+    positions,
+    topology,
+    parameter_set,
+    boxes=None,
+    cutoff_nm=None,
+    frame_stride=1):
+    """
+    Compute total CG potential energy U_CG for each frame.
+
+    Parameters
+    ----------
+    positions : np.ndarray
+        Shape (n_frames, n_beads, 3), coordinates in nm.
+    topology : OpenMM topology
+        CG topology.
+    parameter_set : ParameterSet
+        Current CG parameters.
+    boxes : np.ndarray or None
+        Shape (n_frames, 3), box lengths in nm.
+    cutoff_nm : float or None
+        Nonbonded cutoff in nm.
+    frame_stride : int
+        Use every nth frame.
+
+    Returns
+    -------
+    energies : np.ndarray
+        1D array of total CG energies per frame, in kJ/mol if kBT is in kJ/mol.
+    """
+    bead_types_by_index = get_bead_types_by_index(topology)
+
+    kBT_value = parameter_set.get_fixed("kBT")
+    try:
+        kBT_val = kBT_value.value_in_unit(kilojoule_per_mole)
+    except Exception:
+        kBT_val = float(kBT_value)
+
+
+    # ---------- nonbonded precompute ----------
+    nb_pairs = get_nonbonded_index_pairs(topology)
+    use_pbc = boxes is not None
+
+    if len(nb_pairs) > 0:
+        nb_ii = nb_pairs[:, 0]
+        nb_jj = nb_pairs[:, 1]
+
+        nb_gamma = []
+        nb_a1 = []
+        nb_a2 = []
+
+        for i, j in nb_pairs:
+            bt_i = bead_types_by_index[i]
+            bt_j = bead_types_by_index[j]
+            pair_key = canonical_pair(bt_i, bt_j)
+
+            nb_gamma.append(parameter_set.get_pair(pair_key, "gamma"))
+            nb_a1.append(parameter_set.get_individual(bt_i, "a"))
+            nb_a2.append(parameter_set.get_individual(bt_j, "a"))
+
+        nb_gamma = np.asarray(nb_gamma, dtype=float)
+        nb_a1 = np.asarray(nb_a1, dtype=float)
+        nb_a2 = np.asarray(nb_a2, dtype=float)
+    else:
+        nb_ii = nb_jj = None
+
+    # ---------- bonded precompute ----------
+    bd_pairs = get_bond_index_pairs(topology)
+
+    if len(bd_pairs) > 0:
+        bd_ii = bd_pairs[:, 0]
+        bd_jj = bd_pairs[:, 1]
+
+        bd_b = []
+        for i, j in bd_pairs:
+            bt_i = bead_types_by_index[i]
+            bt_j = bead_types_by_index[j]
+            pair_key = canonical_pair(bt_i, bt_j)
+            bd_b.append(parameter_set.get_pair(pair_key, "b"))
+
+        bd_b = np.asarray(bd_b, dtype=float)
+
+        kBT = parameter_set.get_fixed("kBT")
+        try:
+            kBT_val = kBT.value_in_unit(kilojoule_per_mole)
+        except Exception:
+            kBT_val = float(kBT)
+    else:
+        bd_ii = bd_jj = None
+        bd_b = None
+
+    energies = []
+
+    for frame_idx in range(0, positions.shape[0], frame_stride):
+        pos = positions[frame_idx]
+        U_frame = 0.0
+
+        # ---------- nonbonded energy ----------
+        if len(nb_pairs) > 0:
+            delta = pos[nb_ii] - pos[nb_jj]
+            if use_pbc:
+                box = boxes[frame_idx]
+                delta = minimum_image(delta, box)
+
+            r = np.linalg.norm(delta, axis=1)
+
+            if cutoff_nm is not None:
+                mask = r < cutoff_nm
+                if np.any(mask):
+                    r_use = r[mask]
+                    gamma_use = nb_gamma[mask]
+                    a1_use = nb_a1[mask]
+                    a2_use = nb_a2[mask]
+
+                    D = a1_use * a1_use + a2_use * a2_use
+                    exp_term = np.exp(-(r_use * r_use) / (2.0 * D))
+                    U_nb = np.sum(kBT_val * gamma_use * exp_term)
+                    U_frame += U_nb
+            else:
+                D = nb_a1 * nb_a1 + nb_a2 * nb_a2
+                exp_term = np.exp(-(r * r) / (2.0 * D))
+                U_nb = np.sum(kBT_val * nb_gamma * exp_term)
+                U_frame += U_nb
+
+        # ---------- bonded energy ----------
+        if len(bd_pairs) > 0:
+            delta = pos[bd_ii] - pos[bd_jj]
+            if use_pbc:
+                box = boxes[frame_idx]
+                delta = minimum_image(delta, box)
+
+            r = np.linalg.norm(delta, axis=1)
+            U_bd = np.sum(kBT_val * (3.0 / (2.0 * bd_b * bd_b)) * (r * r))
+            U_frame += U_bd
+
+        energies.append(U_frame)
+
+    return np.asarray(energies, dtype=float)
+
+def calculate_approx_srel_nvt(
+    positions,
+    topology,
+    parameter_set,
+    boxes=None,
+    cutoff_nm=None,
+    frame_stride=1
+    ):
+    """
+    Approximate relative entropy in NVT:
+        Srel_tilde = 0.5 * beta^2 * var(U_CG)
+
+    Parameters
+    ----------
+    positions : np.ndarray
+        Shape (n_frames, n_beads, 3), typically AA-mapped CG coordinates.
+    topology : OpenMM topology
+        CG topology.
+    parameter_set : ParameterSet
+        Current CG parameters.
+    boxes : np.ndarray or None
+        Shape (n_frames, 3), box lengths in nm.
+    cutoff_nm : float or None
+        Nonbonded cutoff in nm.
+    frame_stride : int
+        Use every nth frame.
+
+    Returns
+    -------
+    srel_tilde : float
+        Approximate relative entropy estimate.
+    energy_mean : float
+        Mean CG energy over sampled frames.
+    energy_var : float
+        Variance of CG energy over sampled frames.
+    energies : np.ndarray
+        Per-frame CG energies.
+    """
+    energies = compute_cg_frame_energies(
+        positions=positions,
+        topology=topology,
+        parameter_set=parameter_set,
+        boxes=boxes,
+        cutoff_nm=cutoff_nm,
+        frame_stride=frame_stride
+    )
+
+    if len(energies) == 0:
+        return 0.0, 0.0, 0.0, energies
+
+    energy_mean = float(np.mean(energies))
+    energy_var = float(np.var(energies, ddof=0))
+
+    kBT = parameter_set.get_fixed("kBT")
+    try:
+        beta = 1.0 / kBT.value_in_unit(kilojoule_per_mole)
+    except Exception:
+        beta = 1.0 / float(kBT)
+
+    srel_tilde = 0.5 * (beta ** 2) * energy_var
+
+    return float(srel_tilde), energy_mean, energy_var, energies
 
 
 ################ Csv Writing Utils ###################

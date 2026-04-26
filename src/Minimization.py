@@ -70,10 +70,11 @@ class CG_AA_Minimizer():
         parameter_directory = self.project_name + "/cg_parameters/"
         os.makedirs(parameter_directory, exist_ok=True)
 
-        # Keep RDFs only as diagnostics
         rdf_errors = [["Iteration", "RDF Error"]]
         srel_history = [["Iteration", "Gradient Norm"]]
         h2o_grad_history = [["Iteration", "H2O_H2O_Gradient", "H2O_H2O_Gamma"]]
+        a_history = [["Iteration", "H2O_a", "H2O_a_grad"]]
+        srel_approx_history = [["Iteration", "Approx_Srel", "Mean_U_AA", "Var_U_AA"]]
 
         for i in range(iterations):
             print(f"\n--- Iteration {i} ---")
@@ -96,39 +97,63 @@ class CG_AA_Minimizer():
                 frame_stride=1
             )
 
-            # Log water-water gradient and parameter
-            h2o_key = ('H2O_B1', 'H2O_B1')
+            # 4. Approximate Srel diagnostic
+            srel_tilde, U_mean, U_var, U_frames = calculate_approx_srel_nvt(
+                positions=self.aa_positions,
+                topology=self.cg_sim.topology,
+                parameter_set=self.cg_sim.parameters,
+                boxes=self.aa_boxes,
+                cutoff_nm=self.general_config["cg interaction cutoff"],
+                frame_stride=1
+            )
+
+            srel_approx_history.append([i, srel_tilde, U_mean, U_var])
+            print(f"Approx Srel (AA-mapped frames): {srel_tilde:.6e}")
+            print(f"Mean U_CG on AA frames: {U_mean:.6e}")
+            print(f"Var U_CG on AA frames: {U_var:.6e}")
+
+            # 5. Log H2O gamma and a before update
+            h2o_key = ("H2O_B1", "H2O_B1")
+            h2o_type = "H2O_B1"
+
             h2o_grad = gradients["pair"]["gamma"].get(h2o_key, None)
             h2o_gamma = self.cg_sim.parameters.pair_parameters["gamma"].get(h2o_key, None)
+
+            h2o_a = self.cg_sim.parameters.get_individual(h2o_type, "a")
+            h2o_a_grad = gradients["individual"]["a"].get(h2o_type, None)
+
             h2o_grad_history.append([i, h2o_grad, h2o_gamma])
+            a_history.append([i, h2o_a, h2o_a_grad])
 
-            # 4. Freeze a and bonded b for now
-            for key in gradients["individual"].get("a", {}):
-                gradients["individual"]["a"][key] = 0.0
+            print(f"H2O gamma: {h2o_gamma:.6e}")
+            print(f"H2O gamma grad: {h2o_grad:.6e}")
+            print(f"H2O a: {h2o_a:.6e}")
+            print(f"H2O a grad: {h2o_a_grad:.6e}")
 
-            for key in gradients["pair"].get("b", {}):
-                gradients["pair"]["b"][key] = 0.0
+            # Optional: freeze b if desired
+            # for key in gradients["pair"].get("b", {}):
+            #     gradients["pair"]["b"][key] = 0.0
 
-            # 5. Compute scalar convergence metric
+            # 6. Compute convergence metric
             grad_norm = calculate_srel_gradient_norm(gradients)
             srel_history.append([i, grad_norm])
             print(f"Srel gradient norm: {grad_norm:.6e}")
 
-            # 6. Optional RDF diagnostic
+            # 7. RDF diagnostic
             self.current_rdfs = calculate_current_rdfs(i, self.project_name)
             current_error = calculate_rdf_error(self.target_rdfs, self.current_rdfs)
             rdf_errors.append([i, current_error])
             print(f"RDF diagnostic error: {current_error:.6e}")
 
-            # 7. Save current parameters
+            # 8. Save current parameters
             write_intermediate_parameters(self.cg_sim.parameters, self.project_name, i)
 
-            # 8. Check convergence using Srel metric
+            # 9. Check convergence
             if grad_norm < threshold:
                 print(f"Srel minimization converged in {i} iterations.")
                 break
 
-            # 9. Apply parameter update
+            # 10. Print top gamma gradients
             gamma_grads = gradients["pair"]["gamma"]
             sorted_items = sorted(gamma_grads.items(), key=lambda kv: abs(kv[1]), reverse=True)
 
@@ -136,13 +161,51 @@ class CG_AA_Minimizer():
             for key, val in sorted_items[:10]:
                 old_val = self.cg_sim.parameters.pair_parameters["gamma"][key]
                 expected_delta = -learning_rate * val
-                print(f"{key}: grad={val:.6e}, gamma={old_val:.6e}, expected_delta={expected_delta:.6e}")
+                print(
+                    f"{key}: grad={val:.6e}, "
+                    f"gamma={old_val:.6e}, "
+                    f"expected_delta={expected_delta:.6e}"
+                )
 
+            # 11. Gamma and a update checks before applying gradients
+            old_gamma = self.cg_sim.parameters.pair_parameters["gamma"][h2o_key]
+            gamma_grad = gradients["pair"]["gamma"][h2o_key]
+            expected_new_gamma = old_gamma - learning_rate * gamma_grad
+
+            old_a = self.cg_sim.parameters.get_individual(h2o_type, "a")
+            a_grad = gradients["individual"]["a"][h2o_type]
+            expected_new_a = old_a - learning_rate * a_grad
+
+            print("=== H2O gamma sign check ===")
+            print(f"old gamma:          {old_gamma:.12e}")
+            print(f"gradient:           {gamma_grad:.12e}")
+            print(f"learning rate:      {learning_rate:.12e}")
+            print(f"expected new gamma: {expected_new_gamma:.12e}")
+
+            print("=== H2O width (a) check ===")
+            print(f"old a:              {old_a:.12e}")
+            print(f"a grad:             {a_grad:.12e}")
+            print(f"expected new a:     {expected_new_a:.12e}")
+
+            # 12. Apply gradients
             self.cg_sim.parameters.apply_gradients(gradients, learning_rate)
 
-            print("gamma sample after update:", list(self.cg_sim.parameters.pair_parameters["gamma"].items())[:3])
+            # 13. Log actual updated values
+            actual_new_gamma = self.cg_sim.parameters.pair_parameters["gamma"][h2o_key]
+            actual_new_a = self.cg_sim.parameters.get_individual(h2o_type, "a")
 
-            # 10. Rebuild/update OpenMM system
+            print(f"actual new gamma:   {actual_new_gamma:.12e}")
+            print(f"gamma difference:   {actual_new_gamma - expected_new_gamma:.12e}")
+
+            print(f"actual new a:       {actual_new_a:.12e}")
+            print(f"a difference:       {actual_new_a - expected_new_a:.12e}")
+            print("============================")
+
+            print("gamma sample after update:",
+                list(self.cg_sim.parameters.pair_parameters["gamma"].items())[:3])
+            print(f"updated a: {actual_new_a:.6e}")
+
+            # 14. Rebuild OpenMM system with updated parameters
             self.cg_sim.update_system()
 
         # Finalization
@@ -157,6 +220,14 @@ class CG_AA_Minimizer():
         with open(self.project_name + "/h2o_h2o_gradients.csv", "w", newline="") as file:
             writer = csv.writer(file)
             writer.writerows(h2o_grad_history)
+
+        with open(self.project_name + "/a_history.csv", "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerows(a_history)
+
+        with open(self.project_name + "/srel_approximate.csv", "w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerows(srel_approx_history)
 
         write_final_parameters(self.cg_sim.parameters, self.project_name)
 
