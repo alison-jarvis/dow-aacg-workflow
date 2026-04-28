@@ -153,7 +153,6 @@ def build_universal_bead_mapping(universe, mapping_rules):
             })
             
         mol_index += 1
-    print(bead_defs)
     return bead_defs
 
 

@@ -25,6 +25,12 @@ class BoxPacker:
         if(len(self.mixture_type) != 1):
             raise ValueError("Please enter either 0, 1, or 2 for mixture type")
         self.mixture_type = int(self.mixture_type[0])
+        #check if bead size is available, otherwise default to 3
+        try:
+            self.bead_size = int(self.config["bead size"])
+        except:
+            self.bead_size = 3
+
         try:
             self.mixture_parameters = self.config["mixture parameters"]
         except:
@@ -118,7 +124,7 @@ class BoxPacker:
 
             molecules.append(self.pdb_from_smiles(smiles, resname=resname))
 
-            mol_mapping = auto_mapper.generate_auto_mapping(smiles, cg_resname = resname)
+            mol_mapping = auto_mapper.generate_auto_mapping(smiles, cg_resname = resname, bead_size=1, debug=True)
 
             self.mapping_rules.update(mol_mapping)
 

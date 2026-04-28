@@ -1,7 +1,7 @@
 from rdkit import Chem
 from collections import deque
 
-def generate_auto_mapping(smiles : str, cg_resname = "MOL"):
+def generate_auto_mapping(smiles : str, cg_resname = "MOL", bead_size = 3, debug = False):
     """generates a CG mapping dict for any molecule using graph traversal"""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
