@@ -54,7 +54,9 @@ def extract_bead_mass_mapping(topology):
     bead_masses = dict()
     for atom in topology.atoms():
         unique_id = bead_type_id(atom)
-        bead_masses[unique_id] = 18
+        #bead_masses[unique_id] = 18
+        #bead_masses[unique_id] = 85.5
+        bead_masses[unique_id] = 28.5
     return bead_masses
 
 ############# Forcefield Handling Utils ##############
@@ -128,6 +130,33 @@ def build_derivative_functions(expr_string, eval_param_names, differentiate_name
 
     return first_exprs, first_funcs, second_exprs, second_funcs
 
+############# Gradient Utils #################
+
+def update_positive_log_space(value, grad_value, learning_rate, min_value=1e-4, max_rel_step=0.1):
+    """
+    Update a positive parameter in log space
+
+    value: current parameter value (e.g. b in nm)
+    grad_value: dS/d(value)
+    learning_rate: optimizer learning rate, basic gradient descent
+    min_value: lower bound in same units as value
+    max_rel_step: maximum fractional multiplicative move per step 
+    (0.1 is max ~10% per iteration)
+    """
+    value = max(float(value), min_value)
+
+    # Chain rule: dS/dlog(value) = value * dS/dvalue
+    grad_log = value * grad_value
+
+    # Proposed log step
+    delta_log = -learning_rate * grad_log
+
+    # Clip relative/multiplicative step
+    delta_log = np.clip(delta_log, -max_rel_step, max_rel_step)
+
+    new_value = value * np.exp(delta_log)
+    return max(new_value, min_value)
+
 
 ################# Parameter Object ##################
 
@@ -193,9 +222,15 @@ class ParameterSet:
                 # Check whether to update this parameter
                 if not self.pair_update_flags.get(pname, True):
                     continue
-                # Update the value, enforcing > 0
-                value = self.pair_parameters[pname][key] - learning_rate * grad
-                self.pair_parameters[pname][key] = max(value, 1e-6)
+                old_value = self.pair_parameters[pname][key]
+
+                if pname == "b":
+                    self.pair_parameters[pname][key] = update_positive_log_space(value=old_value, 
+                                                                                 grad_value=grad,
+                                                                                 learning_rate=learning_rate)
+                else:
+                    value = old_value - learning_rate * grad
+                    self.pair_parameters[pname][key] = max(value, 1e-6)
 
         # Individual parameters
         for pname, param_dict in gradients["individual"].items():
